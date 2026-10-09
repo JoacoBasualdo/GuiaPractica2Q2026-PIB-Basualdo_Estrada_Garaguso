@@ -19,6 +19,10 @@ from skimage.segmentation import active_contour
 from skimage.morphology import skeletonize
 from skimage import img_as_float
 from skimage.filters import gaussian
+# IMPORTACIONES ADICIONALES PARA EL MÓDULO 3
+from scipy.stats import skew, entropy
+from skimage.feature import graycomatrix, graycoprops
+from scipy.ndimage import gaussian_filter1d
 # ======================================================
 
 
@@ -440,18 +444,208 @@ def procesar_modulo_2(roi):
     
     plt.tight_layout()
     plt.show()
+    
+    
+    return mascara_limpia
 
-# ==================================
-# Modificando el nombre del video en el main ya está
+def procesar_modulo_3_1(roi, mascara_limpia):
+    """
+    Extracción de Descriptores Morfométricos y de Textura en el frame segmentado.
+    Requiere que procesar_modulo_2() retorne 'mascara_limpia'.
+    """
+    # 1. Descriptores Morfométricos (Forma)
+    contornos, _ = cv2.findContours(mascara_limpia, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contornos:
+        print("No se detectó pupila en la máscara.")
+        return
+        
+    c = max(contornos, key=cv2.contourArea)
+    area = cv2.contourArea(c)
+    perimetro = cv2.arcLength(c, True)
+    
+    M = cv2.moments(c)
+    cX = int(M["m10"] / M["m00"]) if M["m00"] != 0 else 0
+    cY = int(M["m01"] / M["m00"]) if M["m00"] != 0 else 0
+    
+    # Estimación de circularidad
+    circularidad = (4 * np.pi * area) / (perimetro ** 2) if perimetro > 0 else 0
+    
+    print("\n--- 3.1.1 Descriptores Morfométricos ---")
+    print(f"Área (A): {area} px")
+    print(f"Perímetro (P): {perimetro:.2f} px")
+    print(f"Centroide (X_c, Y_c): ({cX}, {cY})")
+    print(f"Circularidad: {circularidad:.4f}")
+
+    # 2. Textura de Primer Orden (Estadística Global)
+    b, g, r = cv2.split(roi)
+    canales = {'Rojo (R)': r, 'Verde (G)': g, 'Azul (B)': b}
+    
+    print("\n--- 3.1.2 Textura de Primer Orden ---")
+    for nombre, canal in canales.items():
+        # Extraer solo píxeles dentro de la ROI segmentada (pupila/iris)
+        pixeles = canal[mascara_limpia > 0]
+        if len(pixeles) == 0:
+            continue
+            
+        media = np.mean(pixeles)
+        desvio = np.std(pixeles)
+        asimetria = skew(pixeles)
+        
+        hist, _ = np.histogram(pixeles, bins=256, range=(0,256), density=True)
+        ent = entropy(hist + 1e-9) # 1e-9 para evitar log(0)
+        
+        print(f"{nombre} -> Media: {media:.2f} | Std: {desvio:.2f} | Skewness: {asimetria:.2f} | Entropía: {ent:.2f}")
+
+    # 3. Textura de Segundo Orden (GLCM)
+    print("\n--- 3.1.3 Textura de Segundo Orden (GLCM) ---")
+    for nombre, canal in canales.items():
+        # Cuantización a 32 niveles de gris
+        canal_cuantizado = (canal // 8).astype(np.uint8)
+        
+        # Calcular GLCM (distancia=1, 4 ángulos)
+        glcm = graycomatrix(canal_cuantizado, distances=[1], angles=[0, np.pi/4, np.pi/2, 3*np.pi/4], 
+                            levels=32, symmetric=True, normed=True)
+        
+        contraste = graycoprops(glcm, 'contrast').mean()
+        homogeneidad = graycoprops(glcm, 'homogeneity').mean()
+        energia = graycoprops(glcm, 'energy').mean()
+        correlacion = graycoprops(glcm, 'correlation').mean()
+        
+        print(f"{nombre} -> Contraste: {contraste:.4f} | Homogeneidad: {homogeneidad:.4f} | Energía: {energia:.4f} | Correlación: {correlacion:.4f}")
+
+
+def procesar_modulo_3_2(video_path):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps == 0: fps = 30 
+    
+    areas = []
+    tiempos = []
+    brillos = [] # NUEVO: Vector para detectar el instante del estímulo
+    frame_idx = 0
+    
+    print("\n--- 3.2 Procesando Video Completo ---")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        x, y, w, h = obtener_roi_automatica(frame)
+        roi = frame[y:y+h, x:x+w]
+        
+        # Calculamos el brillo medio del frame para detectar el apagón
+        brillo_medio = np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))
+        brillos.append(brillo_medio)
+        
+        _, _, r = cv2.split(roi)
+        
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        r_clahe = clahe.apply(r)
+        
+        blur = cv2.GaussianBlur(r_clahe, (5, 5), 0)
+        
+        ret_otsu, mascara_base = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        elemento = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        cierre = cv2.morphologyEx(mascara_base, cv2.MORPH_CLOSE, elemento, iterations=2)
+        mascara_limpia = cv2.morphologyEx(cierre, cv2.MORPH_OPEN, elemento, iterations=1)
+        
+        contornos, _ = cv2.findContours(mascara_limpia, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        area_actual = 0
+        if contornos:
+            mejor_area = 0
+            for c in contornos:
+                area_c = cv2.contourArea(c)
+                perimetro = cv2.arcLength(c, True)
+                if perimetro > 0:
+                    circularidad = (4 * np.pi * area_c) / (perimetro ** 2)
+                    if circularidad > 0.35 and 150 < area_c < 550:
+                        if area_c > mejor_area:
+                            mejor_area = area_c
+            area_actual = mejor_area
+            
+        if area_actual == 0 and len(areas) > 0:
+            area_actual = areas[-1] 
+            
+        areas.append(area_actual)
+        tiempos.append(frame_idx / fps)
+        frame_idx += 1
+        
+    cap.release()
+    
+    if not areas:
+        return
+
+    areas_smooth = gaussian_filter1d(areas, sigma=2.0)
+    
+    # --- LÓGICA TEMPORAL CORREGIDA (ANCLAJE DIRECTO AL ESTÍMULO) ---
+    
+    # 1. Detectar el estímulo (caída abrupta de brillo general)
+    brillos_diff = np.diff(brillos)
+    indice_estimulo = np.argmin(brillos_diff) 
+    tiempo_estimulo = tiempos[indice_estimulo]
+    
+    # Guardamos el área EXACTA que tenía la pupila en el instante del apagón
+    area_en_estimulo = areas_smooth[indice_estimulo] 
+    
+    # 2. Encontrar el pico máximo de dilatación
+    indice_maximo = indice_estimulo + np.argmax(areas_smooth[indice_estimulo:])
+    area_maxima = areas_smooth[indice_maximo]
+    tiempo_maximo = tiempos[indice_maximo]
+    
+    amplitud = area_maxima - area_en_estimulo
+    
+    # 3. Buscar la latencia real:
+    # Apenas el área supere el tamaño del apagón por un margen mínimo (15 px), 
+    # consideramos que inició fisiológicamente la redilatación.
+    umbral_inicio = area_en_estimulo + 15
+    
+    tiempo_inicio_respuesta = tiempo_estimulo
+    for i in range(indice_estimulo, indice_maximo):
+        if areas_smooth[i] > umbral_inicio:
+            tiempo_inicio_respuesta = tiempos[i]
+            break
+            
+    # 4. Cálculo de parámetros fisiológicos
+    latencia_verdadera = tiempo_inicio_respuesta - tiempo_estimulo
+    delta_t_redilatacion = tiempo_maximo - tiempo_inicio_respuesta
+    vel_redilatacion = (amplitud / delta_t_redilatacion) if delta_t_redilatacion > 0 else 0
+
+    # Gráfico
+    plt.figure(figsize=(10, 5))
+    plt.plot(tiempos, areas, label='Área Bruta A(t)', alpha=0.3)
+    plt.plot(tiempos, areas_smooth, label='Área Suavizada', color='red', linewidth=2)
+    
+    plt.axvline(x=tiempo_estimulo, color='black', linestyle='--', label='Estímulo (Flash OFF)')
+    plt.axvline(x=tiempo_inicio_respuesta, color='g', linestyle='--', label='Inicio Redilatación')
+    plt.axvline(x=tiempo_maximo, color='purple', linestyle='--', label='Redilatación Máxima')
+    
+    plt.title('Dinámica Temporal de la Pupila - Registro B (Luz a Oscuridad)')
+    plt.xlabel('Tiempo (s)')
+    plt.ylabel('Área Pupilar (px)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    print("\n--- Parámetros Fisiológicos Extraídos (Registro B) ---")
+    print(f"Área en Estímulo (Luz): {area_en_estimulo:.2f} px")
+    print(f"Amplitud de Redilatación: {amplitud:.2f} px")
+    print(f"Tiempo de Estímulo (Apagón): {tiempo_estimulo:.2f} s")
+    print(f"Latencia Fisiológica: {latencia_verdadera:.2f} s")
+    print(f"Tiempo real de expansión (Delta T): {delta_t_redilatacion:.2f} s")
+    print(f"Velocidad de Redilatación: {vel_redilatacion:.2f} px/s")
+# ======================================================
+# INSERCIÓN EN EL MAIN
+# ======================================================
+
 def main():
     video_original = 'registro_pupila.mp4'
     video_trabajo = 'registro_pupila_copia.mp4'
     
     if not os.path.exists(video_trabajo):
         shutil.copy(video_original, video_trabajo)
-    
-    
-    # -------------------Anidación de funciones---------------------        
+            
     frame_representativo = obtener_mejor_frame(video_trabajo)
     
     if frame_representativo is not None:
@@ -461,12 +655,16 @@ def main():
         procesar_modulo_1_2(frame_representativo, x, y, w, h)
         procesar_modulo_1_3(frame_representativo, x, y, w, h)
         
-        # Extraemos la ROI directamente del frame original
         roi = frame_representativo[y:y+h, x:x+w]
         
-        # Ejecutamos el módulo 2
-        procesar_modulo_2(roi)
-    
+        # Módulo 2 (debe retornar mascara_limpia)
+        mascara_limpia = procesar_modulo_2(roi)
+        
+        # ----- EJECUCIÓN MÓDULO 3 -----
+        procesar_modulo_3_1(roi, mascara_limpia) 
+        
+    # Módulo 3.2 opera independientemente de los modulos anteriores consumiendo todo el video
+    procesar_modulo_3_2(video_trabajo)
 
 
 
