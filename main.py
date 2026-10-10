@@ -89,6 +89,10 @@ def obtener_roi_automatica(frame):
         
     return x, y, w, h
 
+# -------------------------------------------------------------------------------------
+# MÓDULO 1.1
+# -------------------------------------------------------------------------------------
+
 
 def procesar_modulo_1_1(frame, x, y, w, h):
     roi = frame[y:y+h, x:x+w]
@@ -163,6 +167,10 @@ def procesar_modulo_1_1(frame, x, y, w, h):
     plt.tight_layout()
     plt.show()
     
+# -------------------------------------------------------------------------------------
+# MÓDULO 1.2
+# -------------------------------------------------------------------------------------
+    
 def procesar_modulo_1_2(frame, x, y, w, h):
     roi = frame[y:y+h, x:x+w]
     
@@ -228,6 +236,10 @@ def procesar_modulo_1_2(frame, x, y, w, h):
     plt.show()
     
     return roi, roi_clahe
+
+# -------------------------------------------------------------------------------------
+# MÓDULO 1.3
+# -------------------------------------------------------------------------------------
 
 def procesar_modulo_1_3(frame, x, y, w, h):
     roi = frame[y:y+h, x:x+w]
@@ -335,6 +347,10 @@ def procesar_modulo_1_3(frame, x, y, w, h):
     plt.show()
 
     # La fase es la que conserva la información estructural
+    
+# -------------------------------------------------------------------------------------
+# MÓDULO 2
+# -------------------------------------------------------------------------------------
 
 def procesar_modulo_2(roi):
     # Extraemos los canales y nos quedamos solo con el Rojo (R)
@@ -454,6 +470,10 @@ def procesar_modulo_2(roi):
     
     return mascara_limpia
 
+# -------------------------------------------------------------------------------------
+# MÓDULO 3.1
+# -------------------------------------------------------------------------------------
+
 def procesar_modulo_3_1(roi, mascara_limpia):
     """
     Extracción de Descriptores Morfométricos y de Textura en el frame segmentado.
@@ -519,6 +539,10 @@ def procesar_modulo_3_1(roi, mascara_limpia):
         
         print(f"{nombre} -> Contraste: {contraste:.4f} | Homogeneidad: {homogeneidad:.4f} | Energía: {energia:.4f} | Correlación: {correlacion:.4f}")
 
+
+# --------------------------------------------------------------
+# MÓDULO 3.2
+# --------------------------------------------------------------
 
 # ----------------------------------------------------------------------
 # 1) SEGMENTACIÓN FRAME A FRAME
@@ -771,10 +795,12 @@ def _extraer_parametros(t, a, i_est, signo, fps):
     ruido = np.std(s[pre])
  
     post = np.arange(i_est, len(s))
-    i_ext = int(post[np.argmax(s[post])])
-    amp = s[i_ext] - basal
+    i_max = int(post[np.argmax(s[post])])
+    amp = s[i_max] - basal
     if amp <= 0:
         return None
+    # Instante en que se alcanza el 95 % de la respuesta (más estable que el pico de ruido de la meseta)
+    i_ext = next(i for i in range(i_est, i_max + 1) if s[i] >= basal + 0.95 * amp)
  
     umbral_lat = basal + min(max(0.10 * amp, 3 * ruido), 0.30 * amp)
     t_ini = _cruce(t, s, i_est, i_ext, umbral_lat)
@@ -788,7 +814,7 @@ def _extraer_parametros(t, a, i_est, signo, fps):
     vel_media = (0.8 * amp / (t90 - t10)) if (not np.isnan(t10) and not np.isnan(t90) and t90 > t10) else np.nan
  
     return {
-        'basal': float(signo * basal), 'extremo': float(signo * s[i_ext]),
+        'basal': float(signo * basal), 'extremo': float(signo * s[i_max]),
         'amplitud': float(amp), 'i_ext': i_ext, 't_ext': float(t[i_ext]),
         't_ini': float(t_ini), 'latencia': float(t_ini - t_est),
         't10': float(t10), 't90': float(t90),
@@ -806,21 +832,28 @@ def _metricas_error(pares):
 # ----------------------------------------------------------------------
 def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=None,
                         area_min_px=80, area_max_px=900,
-                        manual_contraida=218.0, manual_dilatada=393.0,
+                        manual_contraida=None, manual_dilatada=None,
                         anotaciones_manuales=None, roi_manual=None,
-                        canal=2, etiqueta="Registro B"):
+                        canal=2, etiqueta="Registro B",
+                        mostrar=True, carpeta_salida=None):
     """
     video_path          : ruta del video.
     t_inicio, t_fin     : ventana de análisis en segundos (tiempo del video). Si el video es el completo
                           y querés saltear los primeros 2 s, usá t_inicio=2.0.
     t_estimulo_manual   : si la detección automática del flash falla, indicá el segundo aprox. (ej. 4.8).
     area_min_px/max_px  : rango físicamente plausible del área de pupila en TU video (px²).
-    manual_contraida/dilatada : tus mediciones manuales (218 y 393 px²).
+    manual_contraida/dilatada : niveles manuales (px²). Opcional: si no los pasás, se calculan solos a partir de anotaciones_manuales.
     anotaciones_manuales: opcional, {nro_de_frame: area_manual_px} para MAE/RMSE frame a frame.
     roi_manual          : opcional, (x, y, w, h) para forzar la ROI.
     canal               : 2 = rojo, 1 = verde, 0 = azul, None = gris.
+    t_fin               : None = procesar el video completo.
+    mostrar             : False = no abrir ventanas (útil para procesar varios videos seguidos).
+    carpeta_salida      : si se indica, guarda ahí la curva frame a frame (CSV), los parámetros (CSV)
+                          y las figuras (PNG).
     Devuelve un dict con los parámetros (útil para calcular variabilidad entre registros).
     """
+    if t_fin is None:
+        t_fin = float('inf')
     print(f"\n--- 3.2 Procesando video ({etiqueta}) ---")
  
     cap = cv2.VideoCapture(video_path)
@@ -927,16 +960,32 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
     nombre_resp = "Redilatación" if signo > 0 else "Constricción"
  
     # ---- Validación contra mediciones manuales ----
-    pares = [(contraida, manual_contraida), (dilatada, manual_dilatada)]
-    mae_niv, rmse_niv = _metricas_error(pares)
+    # Si no se pasaron los niveles manuales, se toman de las anotaciones: promedio de las anotadas ANTES del
+    # estímulo y de las anotadas DESPUÉS de completarse la respuesta (la menor es la contraída, la mayor la dilatada).
+    niveles_de_anotaciones = False
+    if anotaciones_manuales and not (manual_contraida and manual_dilatada):
+        pre = [a for fr, a in anotaciones_manuales.items() if fr in frames_idx and t[frames_idx.index(fr)] < t_est]
+        post = [a for fr, a in anotaciones_manuales.items() if fr in frames_idx and t[frames_idx.index(fr)] >= p['t_ext']]
+        if pre and post:
+            m1, m2 = float(np.mean(pre)), float(np.mean(post))
+            manual_contraida, manual_dilatada = min(m1, m2), max(m1, m2)
+            niveles_de_anotaciones = True
+    hay_manual = bool(manual_contraida) and bool(manual_dilatada)
+    mae_niv = rmse_niv = np.nan
+    if hay_manual:
+        mae_niv, rmse_niv = _metricas_error([(contraida, manual_contraida), (dilatada, manual_dilatada)])
     mae_fr = rmse_fr = None
+    tabla = []                                           # (frame, t, manual, auto, era_artefacto)
     if anotaciones_manuales:
-        pares_fr = []
-        for fr, a_man in anotaciones_manuales.items():
+        for fr, a_man in sorted(anotaciones_manuales.items()):
             if fr in frames_idx:
-                pares_fr.append((a_limpia[frames_idx.index(fr)], a_man))
-        if pares_fr:
-            mae_fr, rmse_fr = _metricas_error(pares_fr)
+                k = frames_idx.index(fr)
+                tabla.append((fr, t[k], float(a_man), float(a_limpia[k]), bool(es_art[k])))
+            else:
+                print(f"AVISO: el frame {fr} no está en la ventana analizada "
+                      f"(frames {frames_idx[0]} a {frames_idx[-1]}); se ignora.")
+        if tabla:
+            mae_fr, rmse_fr = _metricas_error([(r[3], r[2]) for r in tabla])
  
     # ---------------- Gráfico 1: curva temporal ----------------
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True,
@@ -945,12 +994,16 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
     if es_art.any():
         ax1.plot(t[es_art], a_limpia[es_art], 'x', color='orange', ms=6, label='Artefacto interpolado')
     ax1.plot(t, a_suave, color='red', lw=2, label='Área suavizada')
-    ax1.axhline(manual_contraida, color='gray', ls=':', label=f'Manual contraída ({manual_contraida:.0f} px²)')
-    ax1.axhline(manual_dilatada, color='gray', ls='-.', label=f'Manual dilatada ({manual_dilatada:.0f} px²)')
+    if hay_manual:
+        ax1.axhline(manual_contraida, color='gray', ls=':', label=f'Manual contraída ({manual_contraida:.0f} px²)')
+        ax1.axhline(manual_dilatada, color='gray', ls='-.', label=f'Manual dilatada ({manual_dilatada:.0f} px²)')
+    if tabla:
+        ax1.plot([r[1] for r in tabla], [r[2] for r in tabla], 's', color='black', mfc='none',
+                 ms=8, mew=1.5, label='Anotaciones manuales (ImageJ)')
     ax1.axvline(t_est, color='black', ls='--', label='Estímulo (cambio del flash)')
     if not np.isnan(p['t_ini']):
         ax1.axvline(p['t_ini'], color='green', ls='--', label=f"Inicio {nombre_resp.lower()}")
-    ax1.axvline(p['t_ext'], color='purple', ls='--', label=f"{nombre_resp} máxima")
+    ax1.axvline(p['t_ext'], color='purple', ls='--', label=f"{nombre_resp} (95 % de la respuesta)")
     ax1.set_title(f'Dinámica Temporal de la Pupila - {etiqueta} ({tipo})')
     ax1.set_ylabel('Área pupilar (px²)')
     ax1.legend(fontsize=8, loc='best')
@@ -978,37 +1031,86 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
         ax.axis('off')
     fig2.suptitle('Verificación de la segmentación (elipse verde = pupila detectada)')
     plt.tight_layout()
-    plt.show()
+    if carpeta_salida:
+        os.makedirs(carpeta_salida, exist_ok=True)
+        base = os.path.join(carpeta_salida, "".join(c if c.isalnum() or c in "-_" else "_" for c in etiqueta))
+        fig.savefig(base + "_curva.png", dpi=120)
+        fig2.savefig(base + "_verificacion.png", dpi=120)
+    if mostrar:
+        plt.show()
+    else:
+        plt.close('all')
  
     # ---------------- Reporte ----------------
     print(f"\n--- Parámetros Fisiológicos Extraídos ({etiqueta}: {tipo}) ---")
     print(f"Tiempo de estímulo: {t_est:.2f} s")
-    print(f"Área contraída (auto): {contraida:.1f} px²   | manual: {manual_contraida:.1f} px²")
-    print(f"Área dilatada  (auto): {dilatada:.1f} px²   | manual: {manual_dilatada:.1f} px²")
-    print(f"Amplitud de respuesta: {p['amplitud']:.1f} px²   | manual: {manual_dilatada - manual_contraida:.1f} px²")
+    man_c = f"   | manual: {manual_contraida:.1f} px²" if hay_manual else ""
+    man_d = f"   | manual: {manual_dilatada:.1f} px²" if hay_manual else ""
+    man_a = f"   | manual: {manual_dilatada - manual_contraida:.1f} px²" if hay_manual else ""
+    print(f"Área contraída (auto): {contraida:.1f} px²{man_c}")
+    print(f"Área dilatada  (auto): {dilatada:.1f} px²{man_d}")
+    print(f"Amplitud de respuesta: {p['amplitud']:.1f} px²{man_a}")
     print(f"Latencia: {p['latencia']:.2f} s   (estímulo -> inicio de {nombre_resp.lower()})")
-    print(f"Tiempo hasta {nombre_resp.lower()} máxima: {p['t_ext'] - t_est:.2f} s")
+    print(f"Tiempo hasta el 95 % de la {nombre_resp.lower()}: {p['t_ext'] - t_est:.2f} s")
     print(f"Velocidad media de {nombre_resp.lower()} (10-90 %): {p['vel_media']:.1f} px²/s")
     print(f"Velocidad pico de {nombre_resp.lower()}: {p['vel_pico']:.1f} px²/s")
-    print(f"\n--- Validación vs. medición manual ---")
-    print(f"Niveles (contraída y dilatada): MAE = {mae_niv:.1f} px² | RMSE = {rmse_niv:.1f} px²")
-    for nombre, auto, man in (("contraída", contraida, manual_contraida), ("dilatada", dilatada, manual_dilatada)):
-        print(f"   {nombre}: error = {auto - man:+.1f} px² ({100 * (auto - man) / man:+.1f} %)")
-    if mae_fr is not None:
-        print(f"Frames anotados ({len(anotaciones_manuales)}): MAE = {mae_fr:.1f} px² | RMSE = {rmse_fr:.1f} px²")
+    if hay_manual:
+        print(f"\n--- Validación vs. medición manual ---")
+        if niveles_de_anotaciones:
+            print("(niveles manuales tomados de tus anotaciones: promedio de las previas al estímulo y de las posteriores a la respuesta)")
+        print(f"Niveles (contraída y dilatada): MAE = {mae_niv:.1f} px² | RMSE = {rmse_niv:.1f} px²")
+        for nombre, auto, man in (("contraída", contraida, manual_contraida), ("dilatada", dilatada, manual_dilatada)):
+            print(f"   {nombre}: error = {auto - man:+.1f} px² ({100 * (auto - man) / man:+.1f} %)")
+    if tabla:
+        print("\nComparación frame a frame (manual vs. automático):")
+        print("  frame    t(s)   manual    auto    error    error %")
+        for fr, tt, man, auto, art in tabla:
+            marca = "  <- frame interpolado (artefacto)" if art else ""
+            print(f"  {fr:5d}  {tt:6.2f}  {man:7.1f}  {auto:7.1f}  {auto - man:+7.1f}  {100 * (auto - man) / man:+7.1f}{marca}")
+        print(f"Frames comparados: {len(tabla)} | MAE = {mae_fr:.1f} px² | RMSE = {rmse_fr:.1f} px²")
+    elif anotaciones_manuales:
+        print("\nNo se pudo comparar ninguna anotación: ningún frame coincide con la ventana analizada.")
  
-    return {
+    d_cont, d_dil = 2 * np.sqrt(contraida / np.pi), 2 * np.sqrt(dilatada / np.pi)
+    resultado = {
         'etiqueta': etiqueta, 'tipo': tipo, 'fps': fps, 't_estimulo': float(t_est),
         'area_contraida': contraida, 'area_dilatada': dilatada,
+        'diametro_contraido': float(d_cont), 'diametro_dilatado': float(d_dil),
         'amplitud': p['amplitud'], 'latencia': p['latencia'],
+        't_hasta_extremo': float(p['t_ext'] - t_est),
         'vel_media': p['vel_media'], 'vel_pico': p['vel_pico'],
+        'frames_artefacto': int(es_art.sum()), 'frames_total': int(len(t)),
         'mae_niveles': mae_niv, 'rmse_niveles': rmse_niv,
+        'mae_frames': mae_fr, 'rmse_frames': rmse_fr,
         'tiempos': t, 'area_cruda': a_cruda, 'area_suave': a_suave,
     }
-    
+ 
+    # ---------------- Salida estandarizada (CSV) ----------------
+    if carpeta_salida:
+        import csv
+        with open(base + "_curva.csv", "w", newline="", encoding="utf-8") as f:
+            wr = csv.writer(f)
+            wr.writerow(["frame", "tiempo_s", "area_cruda_px2", "area_limpia_px2", "area_suave_px2",
+                         "diametro_suave_px", "artefacto"])
+            for k in range(len(t)):
+                wr.writerow([frames_idx[k], f"{t[k]:.4f}",
+                             "" if np.isnan(a_cruda[k]) else f"{a_cruda[k]:.2f}",
+                             f"{a_limpia[k]:.2f}", f"{a_suave[k]:.2f}",
+                             f"{2 * np.sqrt(a_suave[k] / np.pi):.3f}", int(es_art[k])])
+        campos = ["etiqueta", "tipo", "fps", "t_estimulo", "area_contraida", "area_dilatada",
+                  "diametro_contraido", "diametro_dilatado", "amplitud", "latencia", "t_hasta_extremo",
+                  "vel_media", "vel_pico", "frames_artefacto", "frames_total", "mae_niveles", "rmse_niveles"]
+        with open(base + "_parametros.csv", "w", newline="", encoding="utf-8") as f:
+            wr = csv.writer(f)
+            wr.writerow(campos)
+            wr.writerow([f"{resultado[c]:.4f}" if isinstance(resultado[c], float) else resultado[c] for c in campos])
+        print(f"\nCSV guardados en '{carpeta_salida}': {os.path.basename(base)}_curva.csv y _parametros.csv")
+ 
+    return resultado
 
-
-
+# -----------------------------------------------------------------------
+# MÓDULO 4
+# -------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------
 # 1) COMPRESIÓN SIN PÉRDIDA
@@ -1493,7 +1595,7 @@ def exportar_frames_para_medir(video_path,
 
 def main():
     video_original = 'registro_pupila.mp4'
-    video_trabajo = 'registro_pupila_copia.mp4'
+    video_trabajo = 'registro_pupila_copia_2.mp4'
 
     if not os.path.exists(video_trabajo):
         shutil.copy(video_original, video_trabajo)
@@ -1513,13 +1615,10 @@ def main():
         procesar_modulo_3_1(roi, mascara_limpia)
 
     # ----- MÓDULO 3.2 (consume todo el video) -----
-    anotaciones = {132: 624.0, 222: 1204.0}      # agregá todas las que tengas
-    procesar_modulo_3_2(video_trabajo,
-                        anotaciones_manuales=anotaciones,
-                        manual_contraida=624.0,
-                        manual_dilatada=1204.0,
-                        area_min_px=250,
-                        area_max_px=2000)
+    exportar_frames_para_medir(video_trabajo)
+    anotaciones = {132: 624.0, 222: 1204.0}   # {nro_de_frame: área manual en px²}
+    procesar_modulo_3_2(video_trabajo, anotaciones_manuales=anotaciones,
+                    area_min_px=250, area_max_px=2000)
 
     # ----- MÓDULO 4 (sobre el frame representativo) -----
     if frame_representativo is not None:
