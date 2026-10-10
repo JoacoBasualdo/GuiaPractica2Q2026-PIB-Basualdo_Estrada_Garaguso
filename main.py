@@ -26,7 +26,7 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.signal import savgol_filter
 from matplotlib.patches import Ellipse
 # IMPORTACIONES PARA MÓDULO 4
-import zlib
+import heapq
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
 # ======================================================
@@ -1006,128 +1006,464 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
         'tiempos': t, 'area_cruda': a_cruda, 'area_suave': a_suave,
     }
     
-def rle_compresion(canal):
-    """Implementación de compresión Run-Length Encoding 1D"""
-    pixeles = canal.flatten()
-    cambios = np.where(pixeles[:-1] != pixeles[1:])[0] + 1
-    
-    if len(cambios) > 0:
-        valores = np.insert(pixeles[cambios], 0, pixeles[0])
-        longitudes = np.diff(np.append(np.insert(cambios, 0, 0), len(pixeles)))
+
+
+
+
+# ----------------------------------------------------------------------
+# 1) COMPRESIÓN SIN PÉRDIDA
+# ----------------------------------------------------------------------
+def _huffman_longitudes(frecuencias):
+    """Longitud del código de Huffman de cada símbolo (algoritmo clásico con heap)."""
+    simbolos = [(int(f), s) for s, f in enumerate(frecuencias) if f > 0]
+    if len(simbolos) == 1:
+        return {simbolos[0][1]: 1}
+    heap = [(f, s, [s]) for f, s in simbolos]
+    heapq.heapify(heap)
+    largo = {s: 0 for _, s in simbolos}
+    contador = 256
+    while len(heap) > 1:
+        f1, _, g1 = heapq.heappop(heap)
+        f2, _, g2 = heapq.heappop(heap)
+        for s in g1 + g2:
+            largo[s] += 1
+        heapq.heappush(heap, (f1 + f2, contador, g1 + g2))
+        contador += 1
+    return largo
+ 
+ 
+def _huffman_codigos(largo):
+    """Códigos canónicos: alcanza con guardar las longitudes (256 bytes) para decodificar."""
+    orden = sorted(largo.items(), key=lambda kv: (kv[1], kv[0]))
+    codigo, previa, tabla = 0, orden[0][1], {}
+    for s, l in orden:
+        codigo <<= (l - previa)
+        previa = l
+        tabla[s] = (l, codigo)
+        codigo += 1
+    return tabla
+ 
+ 
+def _huffman_tamano(img):
+    """Tamaño exacto en bytes = bits de los datos / 8 + 256 bytes de tabla de longitudes."""
+    frec = np.bincount(img.ravel(), minlength=256)
+    largo = _huffman_longitudes(frec)
+    bits = sum(int(frec[s]) * l for s, l in largo.items())
+    return int(np.ceil(bits / 8.0)) + 256
+ 
+ 
+def _huffman_verificar(img):
+    """Codifica y decodifica de verdad para comprobar que es SIN pérdida (solo imágenes chicas)."""
+    if img.size > 400_000:
+        return None
+    flat = img.ravel()
+    frec = np.bincount(flat, minlength=256)
+    tabla = _huffman_codigos(_huffman_longitudes(frec))
+    lon = np.zeros(256, dtype=np.int64)
+    cod = np.zeros(256, dtype=np.uint64)
+    for s, (l, c) in tabla.items():
+        lon[s], cod[s] = l, c
+    lens, vals = lon[flat], cod[flat]
+    total = int(lens.sum())
+    inicio = np.cumsum(lens) - lens
+    sim = np.repeat(np.arange(flat.size), lens)
+    pos = np.arange(total) - inicio[sim]
+    desplaz = (lens[sim] - 1 - pos).astype(np.uint64)
+    bits = ((vals[sim] >> desplaz) & np.uint64(1)).astype(np.uint8)
+ 
+    inversa = {(l, c): s for s, (l, c) in tabla.items()}
+    salida = np.empty(flat.size, dtype=np.uint8)
+    k, val, ln = 0, 0, 0
+    for b in bits.tolist():
+        val = (val << 1) | b
+        ln += 1
+        s = inversa.get((ln, val))
+        if s is not None:
+            salida[k] = s
+            k += 1
+            val, ln = 0, 0
+    return bool(np.array_equal(salida, flat))
+ 
+ 
+def _rle(flat):
+    """
+    RLE con pares (valor, contador) de 1 byte cada uno. Las corridas de más de 255
+    se parten en varias. Devuelve (tamaño en bytes, verificación de reconstrucción).
+    """
+    cambios = np.flatnonzero(flat[1:] != flat[:-1]) + 1
+    inicios = np.concatenate(([0], cambios))
+    largos = np.diff(np.concatenate((inicios, [flat.size])))
+    trozos = (largos + 254) // 255
+    valores = np.repeat(flat[inicios], trozos)
+    cuentas = np.full(valores.size, 255, dtype=np.int64)
+    cuentas[np.cumsum(trozos) - 1] = largos - 255 * (trozos - 1)
+    ok = bool(np.array_equal(np.repeat(valores, cuentas), flat))
+    return 2 * int(valores.size), ok
+ 
+ 
+def _rle_dos_direcciones(img):
+    horizontal, ok_h = _rle(np.ascontiguousarray(img).ravel())        # recorrido fila por fila
+    vertical, ok_v = _rle(np.ascontiguousarray(img.T).ravel())        # recorrido columna por columna
+    return horizontal, vertical, (ok_h and ok_v)
+ 
+ 
+# ----------------------------------------------------------------------
+# 2) ANÁLISIS DE ARTEFACTOS DE BLOQUE
+# ----------------------------------------------------------------------
+def _salto_bloque(dec, ref, region=None, bloque=8):
+    """
+    Discontinuidad artificial que JPEG agrega en las fronteras de los bloques de 8x8, en niveles de gris.
+    Se mide sobre la imagen de ERROR e = JPEG - original (así se descartan los bordes propios de la imagen):
+        (salto medio de e ENTRE bloques vecinos) - (salto medio de e DENTRO de los bloques).
+    ~0: no hay estructura de bloques. Valores positivos y crecientes: las fronteras 8x8 se hacen visibles.
+    Si se pasa 'region' (máscara booleana) solo cuentan los vecinos que están ambos dentro de ella.
+    """
+    f = dec.astype(np.float32) - ref.astype(np.float32)
+    dh = np.abs(f[:, 1:] - f[:, :-1])
+    dv = np.abs(f[1:, :] - f[:-1, :])
+    jh = (np.arange(dh.shape[1]) % bloque) == bloque - 1
+    jv = (np.arange(dv.shape[0]) % bloque) == bloque - 1
+    if region is None:
+        rh = np.ones(dh.shape, bool)
+        rv = np.ones(dv.shape, bool)
     else:
-        valores = [pixeles[0]]
-        longitudes = [len(pixeles)]
-    
-    # Asumimos 1 byte para el valor del píxel y 1 byte para el contador (longitud)
-    tamaño_comprimido = len(valores) * 2 
-    return tamaño_comprimido
-
-def extraer_area_comprimida(roi_bgr):
-    _, _, r = cv2.split(roi_bgr)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    r_clahe = clahe.apply(r)
-    blur = cv2.GaussianBlur(r_clahe, (5, 5), 0)
-    _, mascara_base = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    # Volvemos a los parámetros exactos del Módulo 3
-    elemento = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    cierre = cv2.morphologyEx(mascara_base, cv2.MORPH_CLOSE, elemento, iterations=2)
-    mascara_limpia = cv2.morphologyEx(cierre, cv2.MORPH_OPEN, elemento, iterations=1)
-    
-    contornos, _ = cv2.findContours(mascara_limpia, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    mejor_area = 0
-    if contornos:
-        for c in contornos:
-            # Envoltura convexa: repara las imperfecciones o roturas causadas por reflejos
-            hull = cv2.convexHull(c)
-            area_c = cv2.contourArea(hull)
-            perimetro = cv2.arcLength(hull, True)
-            
-            if perimetro > 0:
-                circularidad = (4 * np.pi * area_c) / (perimetro ** 2)
-                
-                # Mismos umbrales estrictos validados en el Módulo 3
-                if circularidad > 0.35 and 150 < area_c < 550:
-                    if area_c > mejor_area:
-                        mejor_area = area_c
-                        
-    return mejor_area
-
-def procesar_modulo_4(frame, x, y, w, h):
-    print("\n" + "="*50)
-    print("--- MÓDULO 4: Compresión de Información ---")
-    print("="*50)
-    
-    roi = frame[y:y+h, x:x+w]
+        rh = region[:, 1:] & region[:, :-1]
+        rv = region[1:, :] & region[:-1, :]
+    borde = np.concatenate([dh[jh[None, :] & rh], dv[jv[:, None] & rv]])
+    interior = np.concatenate([dh[(~jh)[None, :] & rh], dv[(~jv)[:, None] & rv]])
+    if borde.size < 50 or interior.size < 50:
+        return np.nan
+    return float(borde.mean() - interior.mean())
+ 
+ 
+def _actividad(ref, region):
+    """Salto medio entre píxeles vecinos de la imagen ORIGINAL en una región (cuánta 'textura' enmascara los artefactos)."""
+    f = ref.astype(np.float32)
+    dh = np.abs(f[:, 1:] - f[:, :-1])[region[:, 1:] & region[:, :-1]]
+    dv = np.abs(f[1:, :] - f[:-1, :])[region[1:, :] & region[:-1, :]]
+    v = np.concatenate([dh, dv])
+    return float(v.mean()) if v.size else np.nan
+ 
+ 
+def _regiones(mascara, roi_gris):
+    """
+    Regiones para comparar dónde se ven más los artefactos:
+      borde   : banda de ~±3 px alrededor del contorno de la pupila (borde nítido)
+      uniforme: iris/esclerótica lejos de la pupila (>10 px) con baja textura local
+    """
+    el = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    borde = cv2.morphologyEx(mascara, cv2.MORPH_GRADIENT, el) > 0
+    lejos = cv2.dilate(mascara, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))) == 0
+    f = roi_gris.astype(np.float32)
+    media = cv2.blur(f, (5, 5))
+    desvio = np.sqrt(np.maximum(cv2.blur(f * f, (5, 5)) - media ** 2, 0))
+    umbral = np.median(desvio[lejos]) if lejos.any() else np.median(desvio)
+    uniforme = lejos & (desvio <= umbral)
+    return borde, uniforme
+ 
+ 
+# ----------------------------------------------------------------------
+# 3) FUNCIÓN PRINCIPAL
+# ----------------------------------------------------------------------
+def procesar_modulo_4(frame, x, y, w, h, area_min_px=250, area_max_px=2000, canal=2):
+    """
+    area_min_px / area_max_px: mismo rango que usás en procesar_modulo_3_2.
+    canal: canal de color con el que se mide la pupila (2 = rojo, igual que el Módulo 3.2).
+    """
+    print("\n" + "=" * 70)
+    print("--- MÓDULO 4: Compresión de la información de imagen ---")
+    print("=" * 70)
+ 
+    FACTORES_Q = [90, 50, 10, 5]                           # los pedidos por la consigna
+    Q_BARRIDO = [95, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5]  # barrido fino para ubicar la aparición de bloques
+    UMBRAL_BLOQUES = 0.5                                   # discontinuidad añadida (niveles de gris) desde la cual se consideran visibles los bloques (criterio heurístico)
+    TOL_DIAMETRO = 0.03                                    # variación relativa del diámetro que se considera "cambio"
+ 
+    roi = np.ascontiguousarray(frame[y:y + h, x:x + w])
     roi_gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    tamaño_original = roi_gris.nbytes
-    print(f"Tamaño Original de la ROI (Escala de grises): {tamaño_original} bytes")
-
+    frame_gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+ 
+    # ---- Segmentación de la pupila en el frame original (mismo método que el Módulo 3.2) ----
+    par = _parametros_segmentacion(area_min_px, area_max_px)
+    c_roi = np.ascontiguousarray(roi[:, :, canal])
+    res0 = _medir_pupila(c_roi, _centro_inicial(c_roi, par), par)
+    mascara = None
+    if res0 is not None:
+        mascara = np.zeros(roi_gris.shape, np.uint8)
+        cv2.ellipse(mascara, res0['elipse'], 255, -1)
+        d0 = 2 * np.sqrt(res0['area'] / np.pi)
+        print(f"Pupila segmentada en el frame original: área = {res0['area']:.1f} px², "
+              f"diámetro equivalente = {d0:.2f} px")
+    else:
+        print("ADVERTENCIA: no se pudo segmentar la pupila en este frame (revisá area_min_px/area_max_px). "
+              "Se omiten la ROI segmentada, el análisis por regiones y el diámetro.")
+ 
+    imagenes = {'Frame original (gris)': frame_gris, 'ROI (gris)': roi_gris}
+    if mascara is not None:
+        imagenes['ROI segmentada (máscara 0/255)'] = mascara
+ 
     # ==========================================================
-    # 1. Compresión sin pérdida (RLE y Huffman)
+    # 1) Compresión con y sin pérdida sobre cada imagen
     # ==========================================================
-    tamaño_rle_h = rle_compresion(roi_gris)
-    ratio_rle_h = tamaño_original / tamaño_rle_h if tamaño_rle_h > 0 else 1
-    
-    tamaño_rle_v = rle_compresion(roi_gris.T)
-    ratio_rle_v = tamaño_original / tamaño_rle_v if tamaño_rle_v > 0 else 1
-    
-    # Utilizamos zlib como proxy de compresión Huffman/LZ77 nativa en Python
-    comprimido_huffman = zlib.compress(roi_gris.tobytes(), level=9)
-    ratio_huffman = tamaño_original / len(comprimido_huffman)
-    
-    print("\n--- 1. Compresión Sin Pérdida ---")
-    print(f"Ratio RLE (Barrido Horizontal): {ratio_rle_h:.2f}:1")
-    print(f"Ratio RLE (Barrido Vertical):   {ratio_rle_v:.2f}:1")
-    print(f"Ratio Huffman (Aprox Zlib):     {ratio_huffman:.2f}:1")
-
+    resultados = {}
+    for nombre, img in imagenes.items():
+        img = np.ascontiguousarray(img)
+        n0 = img.size                                       # bytes sin comprimir (8 bit/píxel)
+        filas = []
+ 
+        t_huff = _huffman_tamano(img)
+        ok_huff = _huffman_verificar(img)
+        t_rh, t_rv, ok_rle = _rle_dos_direcciones(img)
+        filas.append(dict(metodo='Huffman', bytes=t_huff, ratio=n0 / t_huff, psnr=np.inf, ssim=1.0, ok=ok_huff))
+        filas.append(dict(metodo='RLE horizontal', bytes=t_rh, ratio=n0 / t_rh, psnr=np.inf, ssim=1.0, ok=ok_rle))
+        filas.append(dict(metodo='RLE vertical', bytes=t_rv, ratio=n0 / t_rv, psnr=np.inf, ssim=1.0, ok=ok_rle))
+ 
+        for q in FACTORES_Q:
+            _, enc = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+            dec = cv2.imdecode(enc, cv2.IMREAD_GRAYSCALE)
+            filas.append(dict(metodo=f'JPEG Q={q}', bytes=len(enc), ratio=n0 / len(enc),
+                              psnr=psnr(img, dec, data_range=255), ssim=ssim(img, dec, data_range=255), ok=None))
+        resultados[nombre] = filas
+ 
+        print(f"\n>>> {nombre}  [{img.shape[1]}x{img.shape[0]} px | {n0} bytes sin comprimir]")
+        print(f"    {'Método':<16}{'Bytes':>10}{'Ratio':>10}{'PSNR (dB)':>12}{'SSIM':>9}")
+        for f in filas:
+            p = "   inf (=)" if np.isinf(f['psnr']) else f"{f['psnr']:11.2f}"
+            print(f"    {f['metodo']:<16}{f['bytes']:>10d}{f['ratio']:>9.2f}:1{p:>12}{f['ssim']:>9.4f}")
+        veri = []
+        if ok_huff is not None:
+            veri.append(f"Huffman reconstrucción exacta: {'SÍ' if ok_huff else 'NO'}")
+        veri.append(f"RLE reconstrucción exacta: {'SÍ' if ok_rle else 'NO'}")
+        print("    " + " | ".join(veri))
+ 
     # ==========================================================
-    # 2. Compresión con pérdida (JPEG) y Evaluación
+    # 2) Artefactos de bloque y pérdida en la ROI (barrido de Q)
     # ==========================================================
-    factores_q = [90, 50, 10, 5]
-    imagenes_jpeg = []
-    
-    # Calculamos el área original (Ground Truth algorítmico) para comparar
-    area_original = extraer_area_comprimida(roi)
-    print(f"\n--- 2. Compresión Con Pérdida (JPEG) ---")
-    print(f"Área Pupilar Original Detectada: {area_original} px\n")
-    
-    for q in factores_q:
-        # Codificamos a JPEG simulado en memoria
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), q]
-        _, encimg = cv2.imencode('.jpg', roi, encode_param)
-        
-        # Decodificamos para obtener la imagen degradada
-        roi_jpeg_bgr = cv2.imdecode(encimg, cv2.IMREAD_COLOR)
-        roi_jpeg_gris = cv2.cvtColor(roi_jpeg_bgr, cv2.COLOR_BGR2GRAY)
-        imagenes_jpeg.append(roi_jpeg_gris)
-        
-        # Métricas
-        tamaño_jpeg = len(encimg)
-        ratio = tamaño_original / tamaño_jpeg
-        valor_psnr = psnr(roi_gris, roi_jpeg_gris)
-        valor_ssim = ssim(roi_gris, roi_jpeg_gris, data_range=255)
-        
-        # Comprobación de robustez de segmentación
-        area_q = extraer_area_comprimida(roi_jpeg_bgr)
-        error_area = abs(area_original - area_q)
-        
-        print(f"[JPEG Q={q:2d}] Ratio: {ratio:.2f}:1 | PSNR: {valor_psnr:5.2f} dB | SSIM: {valor_ssim:.4f}")
-        print(f"           Área detectada: {area_q} px (Error: {error_area} px)")
-
-    # ==========================================================
-    # 3. Visualización de Artefactos de Bloque
-    # ==========================================================
-    fig, axs = plt.subplots(1, 5, figsize=(18, 4))
-    axs[0].imshow(roi_gris, cmap='gray'); axs[0].set_title('ROI Original')
-    
-    for i, q in enumerate(factores_q):
-        axs[i+1].imshow(imagenes_jpeg[i], cmap='gray')
-        axs[i+1].set_title(f'JPEG Q={q}')
-        
-    plt.suptitle('Evaluación de Artefactos de Bloque (Blocking Artifacts) en JPEG', fontsize=14)
+    barrido = {}
+    if mascara is not None:
+        borde, uniforme = _regiones(mascara, roi_gris)
+        act_b, act_u = _actividad(roi_gris, borde), _actividad(roi_gris, uniforme)
+    d_orig = 2 * np.sqrt(res0['area'] / np.pi) if res0 is not None else np.nan
+ 
+    jpeg_gris, jpeg_color = {}, {}
+    for q in Q_BARRIDO:
+        _, enc = cv2.imencode('.jpg', roi_gris, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+        dec = cv2.imdecode(enc, cv2.IMREAD_GRAYSCALE)
+        jpeg_gris[q] = dec
+        fila = {'sb': _salto_bloque(dec, roi_gris)}
+        if mascara is not None:
+            err = np.abs(roi_gris.astype(np.float32) - dec.astype(np.float32))
+            fila.update(mae_b=float(err[borde].mean()), mae_u=float(err[uniforme].mean()),
+                        sb_b=_salto_bloque(dec, roi_gris, borde), sb_u=_salto_bloque(dec, roi_gris, uniforme))
+            # Diámetro con el MISMO método del Módulo 3.2, sobre la ROI a color comprimida
+            _, enc_c = cv2.imencode('.jpg', roi, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+            dec_c = cv2.imdecode(enc_c, cv2.IMREAD_COLOR)
+            jpeg_color[q] = dec_c
+            rq = _medir_pupila(np.ascontiguousarray(dec_c[:, :, canal]), np.array(res0['centro']), par)
+            fila['area'] = rq['area'] if rq is not None else np.nan
+            fila['diam'] = 2 * np.sqrt(rq['area'] / np.pi) if rq is not None else np.nan
+        barrido[q] = fila
+ 
+    # ---------------- Figura 1: PSNR/SSIM vs ratio ----------------
+    fig1, (axp, axs) = plt.subplots(1, 2, figsize=(14, 5.5))
+    colores = ['tab:blue', 'tab:orange', 'tab:green']
+    marcas = {'Huffman': 's', 'RLE horizontal': '^', 'RLE vertical': 'v'}
+    psnr_fin = [f['psnr'] for fs in resultados.values() for f in fs if np.isfinite(f['psnr'])]
+    tope = max(psnr_fin) + 8
+    for (nombre, filas), col in zip(resultados.items(), colores):
+        jp = [f for f in filas if f['metodo'].startswith('JPEG')]
+        axp.plot([f['ratio'] for f in jp], [f['psnr'] for f in jp], '-o', color=col, label=f'JPEG - {nombre}')
+        axs.plot([f['ratio'] for f in jp], [f['ssim'] for f in jp], '-o', color=col, label=f'JPEG - {nombre}')
+        for f in jp:
+            q = f['metodo'].split('=')[1]
+            axp.annotate(f'Q{q}', (f['ratio'], f['psnr']), textcoords='offset points', xytext=(4, 5), fontsize=7)
+            axs.annotate(f'Q{q}', (f['ratio'], f['ssim']), textcoords='offset points', xytext=(4, 5), fontsize=7)
+        for f in filas:
+            if f['metodo'] in marcas:
+                axp.plot(f['ratio'], tope, marker=marcas[f['metodo']], color=col, mfc='none', ls='')
+                axs.plot(f['ratio'], 1.0, marker=marcas[f['metodo']], color=col, mfc='none', ls='')
+    for m, mk in marcas.items():
+        axp.plot([], [], marker=mk, color='k', mfc='none', ls='', label=f'{m} (sin pérdida)')
+    axp.axhline(tope, color='gray', ls=':')
+    axp.set_ylim(top=tope + 4)
+    axp.text(0.02, 0.97, 'línea punteada: métodos sin pérdida (PSNR = ∞)', transform=axp.transAxes, va='top', fontsize=8, color='gray')
+    axp.set_xscale('log'); axs.set_xscale('log')
+    axp.set_xlabel('Ratio de compresión (log)'); axs.set_xlabel('Ratio de compresión (log)')
+    axp.set_ylabel('PSNR (dB)'); axs.set_ylabel('SSIM')
+    axp.set_title('PSNR vs. ratio'); axs.set_title('SSIM vs. ratio')
+    axp.grid(True, which='both', alpha=0.4); axs.grid(True, which='both', alpha=0.4)
+    axp.legend(fontsize=7, loc='lower left')
+    plt.tight_layout()
+ 
+    # ---------------- Figura 2: observación visual de artefactos ----------------
+    if mascara is not None:
+        cy, cx = int(res0['centro'][1]), int(res0['centro'][0])
+        hz = int(min(max(24, 2.4 * np.sqrt(res0['area'] / np.pi)), min(roi_gris.shape) // 2 - 1))
+        y0, x0 = max(0, cy - hz), max(0, cx - hz)
+        sl = (slice(y0, y0 + 2 * hz), slice(x0, x0 + 2 * hz))
+    else:
+        sl = (slice(None), slice(None))
+    fig2, axs2 = plt.subplots(3, 5, figsize=(17, 10))
+    columnas = [('Original', roi_gris)] + [(f'JPEG Q={q}', jpeg_gris[q]) for q in FACTORES_Q]
+    for j, (titulo, im) in enumerate(columnas):
+        axs2[0, j].imshow(im, cmap='gray', vmin=0, vmax=255); axs2[0, j].set_title(titulo)
+        axs2[1, j].imshow(im[sl], cmap='gray', vmin=0, vmax=255, interpolation='nearest')
+        axs2[1, j].set_title('Zoom borde pupila + iris' if j == 0 else titulo + ' (zoom)')
+        if j == 0:
+            if mascara is not None:
+                vis = np.zeros(roi_gris.shape + (3,), np.uint8)
+                vis[...] = roi_gris[..., None] // 2
+                vis[borde] = (255, 0, 0)
+                vis[uniforme] = (0, 120, 255)
+                axs2[2, 0].imshow(vis); axs2[2, 0].set_title('Regiones (rojo: borde, azul: uniforme)', fontsize=9)
+            else:
+                axs2[2, 0].axis('off')
+        else:
+            err = np.clip(np.abs(roi_gris.astype(np.float32) - im.astype(np.float32)) * 8, 0, 255)
+            axs2[2, j].imshow(err, cmap='magma', vmin=0, vmax=255)
+            axs2[2, j].set_title(f'|Error| x8  (Q={FACTORES_Q[j - 1]})')
+    for a in axs2.ravel():
+        a.axis('off')
+    plt.suptitle('Artefactos de bloque JPEG: ROI completa (arriba), zoom (centro) y mapa de error (abajo)', fontsize=13)
+    plt.tight_layout()
+ 
+    # ---------------- Figura 3: análisis cuantitativo ----------------
+    qs = sorted(barrido, reverse=True)
+    n_graf = 3 if mascara is not None else 1
+    fig3, ax3 = plt.subplots(1, n_graf, figsize=(5.2 * n_graf, 4.6))
+    ax3 = np.atleast_1d(ax3)
+    ax3[0].plot(qs, [barrido[q]['sb'] for q in qs], '-o', label='ROI completa', color='k')
+    if mascara is not None:
+        ax3[0].plot(qs, [barrido[q]['sb_u'] for q in qs], '-o', label='Zona uniforme', color='tab:blue')
+        ax3[0].plot(qs, [barrido[q]['sb_b'] for q in qs], '-o', label='Borde pupila', color='tab:red')
+    ax3[0].axhline(UMBRAL_BLOQUES, color='gray', ls='--', label=f'Umbral visible ({UMBRAL_BLOQUES:g})')
+    ax3[0].set_title('Salto extra entre bloques 8x8 vs. Q'); ax3[0].set_xlabel('Q'); ax3[0].invert_xaxis()
+    ax3[0].set_ylabel('Salto extra (niveles de gris)'); ax3[0].legend(fontsize=8); ax3[0].grid(True)
+    if mascara is not None:
+        ax3[1].plot(qs, [barrido[q]['mae_b'] for q in qs], '-o', color='tab:red', label='Borde pupila')
+        ax3[1].plot(qs, [barrido[q]['mae_u'] for q in qs], '-o', color='tab:blue', label='Zona uniforme')
+        ax3[1].set_title('Error absoluto medio vs. Q'); ax3[1].set_xlabel('Q'); ax3[1].invert_xaxis()
+        ax3[1].set_ylabel('MAE (niveles de gris)'); ax3[1].legend(fontsize=8); ax3[1].grid(True)
+        ax3[2].plot(qs, [barrido[q]['diam'] for q in qs], '-o', color='tab:green', label='Diámetro con JPEG')
+        ax3[2].axhline(d_orig, color='k', ls='--', label='Original')
+        ax3[2].axhspan(d_orig * (1 - TOL_DIAMETRO), d_orig * (1 + TOL_DIAMETRO), color='gray', alpha=0.2,
+                       label=f'±{100 * TOL_DIAMETRO:.0f} %')
+        ax3[2].set_title('Diámetro pupilar (Módulo 3) vs. Q'); ax3[2].set_xlabel('Q'); ax3[2].invert_xaxis()
+        ax3[2].set_ylabel('Diámetro equivalente (px)'); ax3[2].legend(fontsize=8); ax3[2].grid(True)
     plt.tight_layout()
     plt.show()
+ 
+    # ==========================================================
+    # 3) RESPUESTAS A LAS PREGUNTAS DE LA CONSIGNA
+    # ==========================================================
+    print("\n" + "=" * 70)
+    print("RESPUESTAS A LAS PREGUNTAS DE LA CONSIGNA")
+    print("=" * 70)
+ 
+    # --- P1: ratios ---
+    print("\n[1] Tasa de compresión y relación calidad/ratio")
+    for nombre, filas in resultados.items():
+        sin = max((f for f in filas if np.isinf(f['psnr'])), key=lambda f: f['ratio'])
+        con = [f for f in filas if f['metodo'].startswith('JPEG')]
+        print(f"   - {nombre}: mejor método sin pérdida = {sin['metodo']} ({sin['ratio']:.2f}:1); "
+              f"JPEG va de {con[0]['ratio']:.1f}:1 (Q=90, PSNR {con[0]['psnr']:.1f} dB) "
+              f"a {con[-1]['ratio']:.1f}:1 (Q=5, PSNR {con[-1]['psnr']:.1f} dB).")
+        peor = [f['metodo'] for f in filas if np.isinf(f['psnr']) and f['ratio'] < 1]
+        if peor:
+            print(f"     * {' y '.join(peor)}: {'expanden' if len(peor) > 1 else 'expande'} la imagen (ratio < 1) porque casi no "
+                  f"hay corridas de píxeles idénticos.")
+    print("   Nota: RLE solo rinde donde hay corridas largas (máscara binaria). Huffman aprovecha la distribución "
+          "de grises, y JPEG logra ratios mucho mayores a costa de pérdida (PSNR/SSIM bajan al subir el ratio).")
+    print("   Nota: el frame viene de un video ya comprimido (H.264), así que el 'original' no es estrictamente sin pérdida.")
+ 
+    # --- P2: aparición de bloques ---
+    print(f"\n[2] ¿Desde qué factor de calidad aparecen los artefactos de bloque?")
+    ref = 'sb_u' if mascara is not None else 'sb'
+    donde = 'zonas uniformes' if mascara is not None else 'toda la ROI'
+    q_bloque = None
+    for q in qs:                                            # de mayor a menor calidad
+        v = barrido[q][ref]
+        if not np.isnan(v) and v >= UMBRAL_BLOQUES:
+            q_bloque = q
+            break
+    print(f"   Discontinuidad añadida entre bloques 8x8 en {donde} (niveles de gris): " +
+          " | ".join(f"Q={q}: {barrido[q][ref]:.2f}" for q in FACTORES_Q))
+    if q_bloque is None:
+        print(f"   -> En el barrido Q=95..5 el salto extra nunca llega a {UMBRAL_BLOQUES:g} nivel de gris: "
+              f"no se detectan bloques de forma objetiva.")
+    else:
+        print(f"   -> Los bloques de 8x8 emergen a partir de Q ≈ {q_bloque} "
+              f"(salto extra = {barrido[q_bloque][ref]:.2f} niveles; criterio: >= {UMBRAL_BLOQUES:g} nivel, "
+              f"aprox. el umbral de visibilidad de escalones en zonas planas).")
+        print("      Con Q más bajo se vuelven cada vez más evidentes (ver Figura 2: zoom y mapa de error).")
+    print("   Es un criterio objetivo aproximado: confirmalo mirando la Figura 2.")
+ 
+    # --- P3: bordes vs uniformes ---
+    print("\n[3] ¿Los artefactos son más notorios en el borde de la pupila o en regiones uniformes?")
+    if mascara is None:
+        print("   (No disponible: no se pudo segmentar la pupila.)")
+    else:
+        print("   MAE y salto entre bloques en niveles de gris. Visibilidad relativa = salto / actividad local de la imagen original "
+              f"(actividad: borde = {act_b:.1f}, uniforme = {act_u:.1f}).")
+        print(f"   {'Q':>4} | {'MAE borde':>10} {'MAE unif.':>10} | {'Salto borde':>11} {'Salto unif.':>11} | {'Visib. borde':>12} {'Visib. unif.':>12}")
+        for q in FACTORES_Q:
+            b = barrido[q]
+            print(f"   {q:>4} | {b['mae_b']:>10.2f} {b['mae_u']:>10.2f} | {b['sb_b']:>11.2f} {b['sb_u']:>11.2f} | "
+                  f"{b['sb_b'] / max(act_b, 1.0):>12.2f} {b['sb_u'] / max(act_u, 1.0):>12.2f}")
+        qb = 10
+        b = barrido[qb]
+        mae_borde_mayor = b['mae_b'] > b['mae_u']
+        vis_b, vis_u = b['sb_b'] / max(act_b, 1.0), b['sb_u'] / max(act_u, 1.0)
+        vis_uniforme_mayor = vis_u > vis_b
+        factor = max(b['mae_b'], b['mae_u']) / max(min(b['mae_b'], b['mae_u']), 1e-6)
+        if mae_borde_mayor:
+            print(f"   -> Magnitud del error (a Q={qb}): MAYOR en el borde de la pupila ({factor:.1f}x el de las zonas uniformes). "
+                  f"Ahí se concentran el ringing / ruido de mosquito: los bordes nítidos tienen mucha energía en altas "
+                  f"frecuencias, que la cuantización destruye.")
+        else:
+            print(f"   -> Magnitud del error (a Q={qb}): MAYOR en las zonas uniformes ({factor:.1f}x el del borde de la pupila).")
+        if vis_uniforme_mayor:
+            print(f"   -> Visibilidad del efecto de bloque (a Q={qb}): MAYOR en las zonas uniformes ({vis_u:.2f} vs {vis_b:.2f}). "
+                  f"Allí el bloque pierde sus detalles y queda como un parche plano, y el salto contra el vecino no tiene "
+                  f"textura que lo enmascare; en el borde, el propio contraste de la pupila lo disimula.")
+        else:
+            print(f"   -> Visibilidad del efecto de bloque (a Q={qb}): MAYOR en el borde de la pupila ({vis_b:.2f} vs {vis_u:.2f}).")
+        if mae_borde_mayor and vis_uniforme_mayor:
+            print("   Conclusión: el daño numérico se concentra en el borde de la pupila (lo que podría afectar la medición del "
+                  "diámetro), pero la 'cuadrícula' se percibe más en las regiones uniformes del iris/esclerótica.")
+        elif (not mae_borde_mayor) and (not vis_uniforme_mayor):
+            print("   Conclusión: en este frame, tanto el error como la visibilidad de bloques predominan en el borde "
+                  "de la pupila.")
+        else:
+            print("   Conclusión: las dos medidas no coinciden en este frame; interpretá la tabla junto con la Figura 2.")
+ 
+    # --- P4: diámetro ---
+    print("\n[4] ¿La compresión a Q=50 / Q=10 cambia el diámetro pupilar estimado en el Módulo 3?")
+    if mascara is None:
+        print("   (No disponible: no se pudo segmentar la pupila.)")
+    else:
+        print(f"   Original: área = {res0['area']:.1f} px² | diámetro equivalente = {d_orig:.2f} px")
+        for q in FACTORES_Q:
+            a, d = barrido[q]['area'], barrido[q]['diam']
+            if np.isnan(d):
+                print(f"   Q={q:>2}: la segmentación FALLA (no se detecta la pupila).")
+            else:
+                rel = (d - d_orig) / d_orig
+                veredicto = "SÍ cambia" if abs(rel) > TOL_DIAMETRO else "no cambia significativamente"
+                print(f"   Q={q:>2}: área = {a:7.1f} px² | diámetro = {d:6.2f} px | "
+                      f"Δ = {d - d_orig:+.2f} px ({100 * rel:+.1f} %) -> {veredicto} (umbral ±{100 * TOL_DIAMETRO:.0f} %)")
+        cambian = [q for q in (50, 10) if np.isnan(barrido[q]['diam']) or
+                   abs(barrido[q]['diam'] - d_orig) / d_orig > TOL_DIAMETRO]
+        if cambian:
+            print(f"   -> Respuesta: SÍ, a Q={' y Q='.join(map(str, cambian))} el diámetro estimado se aparta más de "
+                  f"{100 * TOL_DIAMETRO:.0f} % del original.")
+        else:
+            print(f"   -> Respuesta: NO. A Q=50 y Q=10 el diámetro estimado queda dentro de ±{100 * TOL_DIAMETRO:.0f} % "
+                  f"del original: el método basado en gradiente del borde es robusto a la compresión moderada.")
+        print("   Nota: la comparación usa un único frame; para generalizar, repetilo en varios frames del video.")
+ 
+    return {'resultados': resultados, 'barrido': barrido, 'q_bloque': q_bloque,
+            'diametro_original': d_orig}
     
 def exportar_frames_para_medir(video_path,
                                tiempos=(0.5, 1.5, 2.5, 3.5, 4.4, 5.2, 5.5, 5.8, 6.2, 6.8, 7.2, 7.4),
@@ -1157,42 +1493,38 @@ def exportar_frames_para_medir(video_path,
 
 def main():
     video_original = 'registro_pupila.mp4'
-    video_trabajo = 'registro_pupila_copia_2.mp4'
-    
+    video_trabajo = 'registro_pupila_copia.mp4'
+
     if not os.path.exists(video_trabajo):
         shutil.copy(video_original, video_trabajo)
-            
+
     frame_representativo = obtener_mejor_frame(video_trabajo)
-    
+
+    # ----- MÓDULOS 1, 2 y 3.1 (sobre el frame representativo) -----
     if frame_representativo is not None:
         x, y, w, h = obtener_roi_automatica(frame_representativo)
-        
+
         procesar_modulo_1_1(frame_representativo, x, y, w, h)
         procesar_modulo_1_2(frame_representativo, x, y, w, h)
         procesar_modulo_1_3(frame_representativo, x, y, w, h)
-        
-        roi = frame_representativo[y:y+h, x:x+w]
-        
-        # Módulo 2 (debe retornar mascara_limpia)
-        mascara_limpia = procesar_modulo_2(roi)
-        
-        # ----- EJECUCIÓN MÓDULO 3 -----
-        procesar_modulo_3_1(roi, mascara_limpia) 
-        
-        procesar_modulo_4(frame_representativo, x, y, w, h)
-        
-    # Módulo 3.2 opera independientemente de los modulos anteriores consumiendo todo el video
-    anotaciones = {132: 624.0, 222: 1204.0}      # agregá todas las que tengas
 
+        roi = frame_representativo[y:y+h, x:x+w]
+        mascara_limpia = procesar_modulo_2(roi)
+        procesar_modulo_3_1(roi, mascara_limpia)
+
+    # ----- MÓDULO 3.2 (consume todo el video) -----
+    anotaciones = {132: 624.0, 222: 1204.0}      # agregá todas las que tengas
     procesar_modulo_3_2(video_trabajo,
                         anotaciones_manuales=anotaciones,
                         manual_contraida=624.0,
                         manual_dilatada=1204.0,
                         area_min_px=250,
                         area_max_px=2000)
-    
-    exportar_frames_para_medir(video_trabajo)
 
+    # ----- MÓDULO 4 (sobre el frame representativo) -----
+    if frame_representativo is not None:
+        procesar_modulo_4(frame_representativo, x, y, w, h,
+                          area_min_px=250, area_max_px=2000)
 
 
 if __name__ == '__main__':
