@@ -1,0 +1,2 @@
+etiqueta,tipo,fps,t_estimulo,area_contraida,area_dilatada,diametro_contraido,diametro_dilatado,amplitud,latencia,t_hasta_extremo,vel_media,vel_pico,frames_artefacto,frames_total,mae_niveles,rmse_niveles
+Registro B,Luz a Oscuridad,30.0537,4.6583,652.5941,1318.1969,28.8255,40.9680,665.6028,-0.0840,1.9964,259.6000,1882.7453,14,226,71.3955,83.2423

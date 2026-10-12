@@ -14,6 +14,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import shutil
 import os
+import csv
 # IMPORTACIONES ADICIONALES PARA EL MÓDULO 2
 from skimage.segmentation import active_contour
 from skimage.morphology import skeletonize
@@ -24,12 +25,41 @@ from scipy.stats import skew, entropy
 from skimage.feature import graycomatrix, graycoprops
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import savgol_filter
-from matplotlib.patches import Ellipse
+from matplotlib.patches import Ellipse, Rectangle
 # IMPORTACIONES PARA MÓDULO 4
 import heapq
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
 # ======================================================
+
+# ======================================================================
+# UTILIDADES COMUNES
+# ======================================================================
+def _mascara_pupila_elipse(roi, area_min_px=250, area_max_px=2000, canal=2):
+    """Pupila segmentada con el método del Módulo 3.2. Devuelve (máscara uint8 0/255, resultado) o (None, None)."""
+    par = _parametros_segmentacion(area_min_px, area_max_px)
+    c = np.ascontiguousarray(roi[:, :, canal]) if roi.ndim == 3 else np.ascontiguousarray(roi)
+    res = _medir_pupila(c, _centro_inicial(c, par), par)
+    if res is None:
+        return None, None
+    m = np.zeros(c.shape, np.uint8)
+    cv2.ellipse(m, res['elipse'], 255, -1)
+    return m, res
+ 
+ 
+def leer_frame_en(video_path, t_seg):
+    """Lee el frame del instante t_seg (en segundos)."""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(round(t_seg * fps)))
+    ret, f = cap.read()
+    cap.release()
+    return f if ret else None
+ 
+ 
+def _banda_borde(mascara, ancho=5):
+    el = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ancho, ancho))
+    return cv2.morphologyEx(mascara, cv2.MORPH_GRADIENT, el) > 0
 
 
 # ======================================================
@@ -170,6 +200,24 @@ def procesar_modulo_1_1(frame, x, y, w, h):
 # -------------------------------------------------------------------------------------
 # MÓDULO 1.2
 # -------------------------------------------------------------------------------------
+
+def rango_pupila_iris(roi, area_min_px=250, area_max_px=2000):
+    """[f1, f2] = niveles de gris que abarcan la pupila y el iris (sin reflejos). Respaldo: percentiles 1 y 40."""
+    gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    m, res = _mascara_pupila_elipse(roi, area_min_px, area_max_px)
+    if m is None:
+        return float(np.percentile(gris, 1)), float(np.percentile(gris, 40))
+    cx, cy = res['centro']
+    r = np.sqrt(res['area'] / np.pi)
+    yy, xx = np.indices(gris.shape)
+    zona = (np.hypot(xx - cx, yy - cy) <= 2.6 * r) & (gris < 235)
+    v = gris[zona]
+    return float(np.percentile(v, 1)), float(np.percentile(v, 99))
+ 
+ 
+def escalar_rango(gris, f1, f2):
+    """Transformación lineal: f1 -> 0 y f2 -> 255; lo que queda afuera se satura."""
+    return (np.clip((gris.astype(np.float32) - f1) / max(f2 - f1, 1e-6), 0, 1) * 255).astype(np.uint8)
     
 def procesar_modulo_1_2(frame, x, y, w, h):
     roi = frame[y:y+h, x:x+w]
@@ -203,7 +251,9 @@ def procesar_modulo_1_2(frame, x, y, w, h):
     # Lo que hace el escalado por rango de interes es un ajuste lineal agarrando el valor minimo, anclandolo e 0 y el valor máximo en 255. Los píxeles intermedos se separas de manera proporcional
     # El histograma realiza un ajuste no lineal más agresivo, donde se busca cuáles son los tonos de gris más repetidos y los separa para que abarquen más niveles de luz.
     # La ecualización global divide la imagen en cuadrículas pequeñas y calcula un histograma y ecualiza cada cuadradito por separado
-    roi_escalada = cv2.normalize(roi_gris, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+    f1, f2 = rango_pupila_iris(roi)
+    roi_escalada = escalar_rango(roi_gris, f1, f2)
+    print(f"Escalado por rango de interés: [f1, f2] = [{f1:.0f}, {f2:.0f}]")
     roi_ecualizada = cv2.equalizeHist(roi_gris)
     
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
@@ -237,120 +287,484 @@ def procesar_modulo_1_2(frame, x, y, w, h):
     
     return roi, roi_clahe
 
-# -------------------------------------------------------------------------------------
-# MÓDULO 1.3
-# -------------------------------------------------------------------------------------
-
-def procesar_modulo_1_3(frame, x, y, w, h):
-    roi = frame[y:y+h, x:x+w]
-    roi_gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    roi_suavizada = cv2.GaussianBlur(roi_gris, (5, 5), 0) # Le aplicamos un filtro gausseano dado que los detectores de bordes son extremadamente sensibles al ruido de alta frecuencia
-
-    # Roberts y Prewitt no tienen funciones nativas en OpenCV, por lo tanto para implementarlas hay que pasarle manualmente los kernels.
-    kernel_roberts_x = np.array([[1, 0], [0, -1]], dtype=np.float32)
-    kernel_roberts_y = np.array([[0, 1], [-1, 0]], dtype=np.float32)
-    roberts_x = cv2.filter2D(roi_suavizada, cv2.CV_64F, kernel_roberts_x)
-    roberts_y = cv2.filter2D(roi_suavizada, cv2.CV_64F, kernel_roberts_y)
-    roberts = cv2.convertScaleAbs(cv2.magnitude(roberts_x, roberts_y))
-
-    kernel_prewitt_x = np.array([[1, 0, -1], [1, 0, -1], [1, 0, -1]], dtype=np.float32)
-    kernel_prewitt_y = np.array([[1, 1, 1], [0, 0, 0], [-1, -1, -1]], dtype=np.float32)
-    prewitt_x = cv2.filter2D(roi_suavizada, cv2.CV_64F, kernel_prewitt_x)
-    prewitt_y = cv2.filter2D(roi_suavizada, cv2.CV_64F, kernel_prewitt_y)
-    prewitt = cv2.convertScaleAbs(cv2.magnitude(prewitt_x, prewitt_y))
-
-    sobel_x = cv2.Sobel(roi_suavizada, cv2.CV_64F, 1, 0, ksize=3)
-    sobel_y = cv2.Sobel(roi_suavizada, cv2.CV_64F, 0, 1, ksize=3)
-    sobel = cv2.convertScaleAbs(cv2.magnitude(sobel_x, sobel_y))
-
-    laplaciano = cv2.convertScaleAbs(cv2.Laplacian(roi_suavizada, cv2.CV_64F))
-
-    canny = cv2.Canny(roi_suavizada, 50, 150)
-
-    fig, axs = plt.subplots(3, 2, figsize=(12, 16))
-
-    axs[0, 0].imshow(roi_suavizada, cmap='gray', vmin=0, vmax=255)
-    axs[0, 0].set_title('ROI Pre-procesada (Gaussiano 5x5)')
-
-    axs[0, 1].imshow(roberts, cmap='gray', vmin=0, vmax=255)
-    axs[0, 1].set_title('Bordes: Roberts')
-
-    axs[1, 0].imshow(prewitt, cmap='gray', vmin=0, vmax=255)
-    axs[1, 0].set_title('Bordes: Prewitt')
-
-    axs[1, 1].imshow(sobel, cmap='gray', vmin=0, vmax=255)
-    axs[1, 1].set_title('Bordes: Sobel')
-
-    axs[2, 0].imshow(laplaciano, cmap='gray', vmin=0, vmax=255)
-    axs[2, 0].set_title('Bordes: Laplaciano')
-
-    axs[2, 1].imshow(canny, cmap='gray', vmin=0, vmax=255)
-    axs[2, 1].set_title('Bordes: Canny (50-150)')
-
-    plt.tight_layout(h_pad=3.0, w_pad=2.0)
+# ======================================================================
+# B) 1.2.4  Ruido y filtrado espacial 
+# ======================================================================
+def _agregar_ruido(gris, tipo, rng):
+    g = gris.astype(np.float32)
+    if tipo == 'Gaussiano':
+        r = g + rng.normal(0, 20, g.shape)
+    elif tipo == 'Sal y pimienta':
+        r = g.copy()
+        u = rng.random(g.shape)
+        r[u < 0.025] = 0
+        r[u > 0.975] = 255
+    else:  # Speckle (multiplicativo)
+        r = g + g * rng.normal(0, 0.25, g.shape)
+    return np.clip(r, 0, 255).astype(np.uint8)
+ 
+ 
+def procesar_modulo_1_2_4(roi, area_min_px=250, area_max_px=2000):
+    print("\n" + "=" * 70)
+    print("--- 1.2.4 Ruido y filtrado espacial ---")
+    print("=" * 70)
+    gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    rng = np.random.default_rng(0)
+ 
+    filtros = {
+        'Media': lambda im, k: cv2.blur(im, (k, k)),
+        'Mediana': lambda im, k: cv2.medianBlur(im, k),
+        'Gaussiano': lambda im, k: cv2.GaussianBlur(im, (k, k), 0),
+    }
+ 
+    # ---------- (1) Ruidos típicos y filtros de 5x5 ----------
+    ruidos = ['Gaussiano', 'Sal y pimienta', 'Speckle']
+    fig, axs = plt.subplots(3, 4, figsize=(15, 11))
+    mejores = {}
+    print("\nPSNR (dB) / SSIM de cada imagen contra la original SIN ruido (filtros 5x5):")
+    print(f"{'Ruido':<16}{'Sin filtrar':>16}" + "".join(f"{n:>16}" for n in filtros))
+    for i, tipo in enumerate(ruidos):
+        ruidosa = _agregar_ruido(gris, tipo, rng)
+        fila = [('Sin filtrar', ruidosa)] + [(n, f(ruidosa, 5)) for n, f in filtros.items()]
+        textos, vals = [], {}
+        for j, (nombre, im) in enumerate(fila):
+            p, s = psnr(gris, im, data_range=255), ssim(gris, im, data_range=255)
+            textos.append(f"{p:5.1f}/{s:.3f}")
+            vals[nombre] = (p, s)
+            axs[i, j].imshow(im, cmap='gray', vmin=0, vmax=255)
+            axs[i, j].set_title(f"{tipo}\n{nombre}  {p:.1f} dB / {s:.3f}", fontsize=9)
+            axs[i, j].axis('off')
+        print(f"{tipo:<16}" + "".join(f"{t:>16}" for t in textos))
+        mejores[tipo] = max(filtros, key=lambda n: vals[n][1])
+    plt.tight_layout()
+ 
+    print("\nMejor filtro (por SSIM) para cada ruido:")
+    for tipo, n in mejores.items():
+        print(f"   - {tipo}: {n}")
+ 
+    # ---------- (2) Pregunta de la guía: ¿qué filtro preserva los bordes de la pupila y elimina los destellos? ----------
+    mascara, res = _mascara_pupila_elipse(roi, area_min_px, area_max_px)
+    sat = (gris >= 235).astype(np.uint8)
+    n, et, st, cen = cv2.connectedComponentsWithStats(sat, connectivity=8)
+    dest = np.zeros(gris.shape, np.uint8)
+    for k in range(1, n):
+        if st[k, cv2.CC_STAT_AREA] > 400:
+            continue                                         # zonas saturadas grandes (piel/esclerótica) no son destellos
+        if res is not None:
+            r = np.sqrt(res['area'] / np.pi)
+            if np.hypot(cen[k][0] - res['centro'][0], cen[k][1] - res['centro'][1]) > 3.0 * r:
+                continue                                     # solo destellos cerca de la pupila
+        dest[et == k] = 1
+ 
+    print("\n--- Pregunta: ¿qué filtro preserva los bordes de la pupila eliminando los destellos? ---")
+    if not dest.any() or mascara is None:
+        print("No se detectaron destellos saturados (>=235) junto a la pupila, o no se pudo segmentar la pupila: "
+              "no se puede hacer esta comparación en este frame.")
+        plt.show()
+        return
+    dest_d = cv2.dilate(dest, np.ones((3, 3), np.uint8), iterations=2)
+    ref = cv2.inpaint(gris, dest_d * 255, 5, cv2.INPAINT_TELEA)    # "lo ideal": imagen sin el destello
+    banda = _banda_borde(mascara)
+    gx = lambda im: np.hypot(cv2.Sobel(im, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(im, cv2.CV_32F, 0, 1, ksize=3))
+    grad_ref = gx(ref)[banda].mean()
+    exceso0 = float(gris[dest_d > 0].mean() - ref[dest_d > 0].mean())
+    print(f"Destello detectado: {int(dest.sum())} px (nivel medio {gris[dest > 0].mean():.0f}; "
+          f"sin destello sería ~{ref[dest > 0].mean():.0f})")
+ 
+    kernels = [5, 11, 21]
+    filas = []
+    print(f"\n{'Filtro':<11}{'Kernel':>7}{'Destello eliminado':>20}{'Borde retenido':>16}{'PSNR':>9}{'SSIM':>8}")
+    for nombre, f in filtros.items():
+        for k in kernels:
+            im = f(gris, k)
+            elim = float(np.clip(100 * (1 - (float(im[dest_d > 0].mean() - ref[dest_d > 0].mean()) / exceso0)), 0, 100))
+            ret = 100 * gx(im)[banda].mean() / grad_ref
+            p, s = psnr(ref, im, data_range=255), ssim(ref, im, data_range=255)
+            filas.append((nombre, k, elim, ret, p, s, im))
+            print(f"{nombre:<11}{k:>5}x{k:<2}{elim:>18.0f} %{ret:>14.0f} %{p:>9.1f}{s:>8.3f}")
+ 
+    cand = [f for f in filas if f[2] >= 80]
+    if cand:
+        mejor = max(cand, key=lambda f: f[3])
+        print(f"\n-> Entre los que eliminan >= 80 % del destello, el que mejor conserva el borde pupilar es: "
+              f"{mejor[0]} {mejor[1]}x{mejor[1]} (destello eliminado {mejor[2]:.0f} %, borde retenido {mejor[3]:.0f} %).")
+    else:
+        mejor = max(filas, key=lambda f: f[2])
+        print(f"\n-> Ningún filtro llega a eliminar el 80 % del destello. El que más lo reduce es {mejor[0]} "
+              f"{mejor[1]}x{mejor[1]} ({mejor[2]:.0f} %), con borde retenido {mejor[3]:.0f} %.")
+    print("   (Si ninguno es satisfactorio, el destello se trata con morfología/relleno, como hace el pipeline en _rellenar_reflejos.)")
+ 
+    # Figura: zoom sobre la pupila para cada filtro/kernel
+    cx, cy = res['centro']
+    hz = int(2.6 * np.sqrt(res['area'] / np.pi))
+    y0, x0 = max(0, int(cy) - hz), max(0, int(cx) - hz)
+    sl = (slice(y0, y0 + 2 * hz), slice(x0, x0 + 2 * hz))
+    fig2, axs2 = plt.subplots(3, 4, figsize=(14, 10))
+    for i, nombre in enumerate(filtros):
+        axs2[i, 0].imshow(gris[sl], cmap='gray', vmin=0, vmax=255)
+        axs2[i, 0].set_title('Original (con destello)', fontsize=9)
+        for j, k in enumerate(kernels):
+            f = [x for x in filas if x[0] == nombre and x[1] == k][0]
+            axs2[i, j + 1].imshow(f[6][sl], cmap='gray', vmin=0, vmax=255)
+            axs2[i, j + 1].set_title(f"{nombre} {k}x{k}\ndestello -{f[2]:.0f}% | borde {f[3]:.0f}%", fontsize=9)
+    for a in axs2.ravel():
+        a.axis('off')
+    plt.suptitle('Destello del flash vs. borde de la pupila según filtro y tamaño de kernel')
+    plt.tight_layout()
     plt.show()
-    
-    
-    # Ahora le aplicamos la TFD-2D
-    f = np.fft.fft2(roi_gris)
-    fshift = np.fft.fftshift(f)
 
-    # Cálculo de Magnitud (en escala logarítmica para visualización)
-    espectro_magnitud = 20 * np.log(np.abs(fshift))
-    
-    # Cálculo de Fase (ángulos en radianes)
-    espectro_fase = np.angle(fshift)
+# ======================================================================
+# C) 1.3  Bordes, TFD-2D, PSD y filtrado en frecuencia
+# -------------------------------------------------------------------------------------
 
+def _canny_auto(img):
+    """Canny con umbrales automáticos (alto = percentil 92 del gradiente, bajo = 40 % del alto): sirve con cualquier brillo/filtrado."""
+    mag = cv2.magnitude(cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3))
+    alto = float(np.percentile(mag, 92))
+    return cv2.Canny(img, 0.4 * alto, alto, L2gradient=True)
+ 
+ 
+def _operadores_borde(img):
+    """Devuelve {nombre: imagen binaria de bordes} (los gradientes se binarizan con Otsu)."""
+    def binarizar(mag):
+        mag = cv2.convertScaleAbs(mag)
+        _, b = cv2.threshold(mag, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return b
+    kr_x = np.array([[1, 0], [0, -1]], np.float32)
+    kr_y = np.array([[0, 1], [-1, 0]], np.float32)
+    kp_x = np.array([[1, 0, -1], [1, 0, -1], [1, 0, -1]], np.float32)
+    kp_y = np.array([[1, 1, 1], [0, 0, 0], [-1, -1, -1]], np.float32)
+    f = lambda k: cv2.filter2D(img, cv2.CV_64F, k)
+    return {
+        'Roberts': binarizar(cv2.magnitude(f(kr_x), f(kr_y))),
+        'Prewitt': binarizar(cv2.magnitude(f(kp_x), f(kp_y))),
+        'Sobel': binarizar(cv2.magnitude(cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3),
+                                          cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3))),
+        'Laplaciano': binarizar(cv2.Laplacian(img, cv2.CV_64F)),
+        'Canny': _canny_auto(img),
+    }
+ 
+ 
+def _continuidad_y_espurios(bordes, mascara, n_sect=72):
+    """
+    Continuidad = % de los 72 sectores angulares del contorno pupilar donde hay al menos un píxel de borde.
+    Espurios   = % de píxeles lejos del contorno pupilar que fueron marcados como borde (ruido/textura).
+    """
+    banda = _banda_borde(mascara, 7)
+    ys, xs = np.nonzero(mascara)
+    cy, cx = ys.mean(), xs.mean()
+    by, bx = np.nonzero(banda & (bordes > 0))
+    sect = ((np.arctan2(by - cy, bx - cx) + np.pi) / (2 * np.pi) * n_sect).astype(int) % n_sect
+    cont = 100.0 * len(np.unique(sect)) / n_sect
+    lejos = cv2.dilate(banda.astype(np.uint8), np.ones((15, 15), np.uint8)) == 0
+    esp = 100.0 * ((bordes > 0) & lejos).sum() / lejos.sum()
+    return cont, esp
+ 
+ 
+def _tfd(img):
+    F = np.fft.fft2(img.astype(np.float64))
+    return np.abs(F), np.angle(F)
+ 
+ 
+def _recon(mag, fase):
+    return np.real(np.fft.ifft2(mag * np.exp(1j * fase)))
+ 
+ 
+def _norm_vis(im):
+    lo, hi = np.percentile(im, 1), np.percentile(im, 99)
+    return np.clip((im - lo) / max(hi - lo, 1e-9), 0, 1)
+ 
+ 
+def _corr(a, b):
+    return float(np.corrcoef(a.ravel(), b.ravel())[0, 1])
+ 
+ 
+def _psd_radial(img):
+    """PSD = |TFD|^2 (sin la componente continua) promediada en anillos de frecuencia. Devuelve (frecuencia [ciclos/px], PSD)."""
+    im = img.astype(np.float64)
+    P = np.abs(np.fft.fftshift(np.fft.fft2(im - im.mean()))) ** 2
+    h, w = P.shape
+    yy, xx = np.indices(P.shape)
+    r = np.hypot(xx - w // 2, yy - h // 2).astype(int)
+    n = min(h, w) // 2
+    suma = np.bincount(r.ravel(), P.ravel(), minlength=n + 1)[:n]
+    cuenta = np.maximum(np.bincount(r.ravel(), minlength=n + 1)[:n], 1)
+    return np.arange(n) / min(h, w), suma / cuenta, P
+ 
+ 
+def _filtrar_frecuencia(img, H_fun):
+    """Filtra en frecuencia con H(f) (f en ciclos/píxel) usando relleno por reflejo para evitar el efecto de borde."""
+    pad = min(img.shape) // 4
+    im = np.pad(img.astype(np.float64), pad, mode='reflect')
+    fy = np.fft.fftfreq(im.shape[0])[:, None]
+    fx = np.fft.fftfreq(im.shape[1])[None, :]
+    H = H_fun(np.hypot(fx, fy))
+    out = np.real(np.fft.ifft2(np.fft.fft2(im) * H))
+    return out[pad:-pad, pad:-pad]
+ 
+ 
+def procesar_modulo_1_3(frame, x, y, w, h, frame_otro=None, sigma_filtro=2.0, area_min_px=250, area_max_px=2000):
+    print("\n" + "=" * 70)
+    print("--- 1.3 Bordes y dominio frecuencial ---")
+    print("=" * 70)
+    roi = np.ascontiguousarray(frame[y:y + h, x:x + w])
+    gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    suave = cv2.GaussianBlur(gris, (5, 5), 0)
+ 
+    # ---------------- 1.3.1 Bordes: original vs. filtrada ----------------
+    mascara, res = _mascara_pupila_elipse(roi, area_min_px, area_max_px)
+    b_orig, b_filt = _operadores_borde(gris), _operadores_borde(suave)
+    fig, axs = plt.subplots(2, 6, figsize=(20, 7.5))
+    axs[0, 0].imshow(gris, cmap='gray'); axs[0, 0].set_title('ROI original')
+    axs[1, 0].imshow(suave, cmap='gray'); axs[1, 0].set_title('ROI filtrada (Gaussiano 5x5)')
+    print("\n1.3.1 Continuidad del contorno pupilar y bordes espurios (gradientes binarizados con Otsu; Canny con umbrales automáticos)")
+    if mascara is not None:
+        print(f"{'Operador':<12}{'Continuidad orig.':>19}{'filtrada':>10}{'Espurios orig.':>17}{'filtrada':>10}")
+    for j, nombre in enumerate(b_orig, start=1):
+        axs[0, j].imshow(b_orig[nombre], cmap='gray'); axs[1, j].imshow(b_filt[nombre], cmap='gray')
+        t0, t1 = nombre, nombre
+        if mascara is not None:
+            c0, e0 = _continuidad_y_espurios(b_orig[nombre], mascara)
+            c1, e1 = _continuidad_y_espurios(b_filt[nombre], mascara)
+            print(f"{nombre:<12}{c0:>17.0f} %{c1:>8.0f} %{e0:>15.1f} %{e1:>8.1f} %")
+            t0, t1 = f"{nombre} (original)\ncontinuidad {c0:.0f}%", f"{nombre} (filtrada)\ncontinuidad {c1:.0f}%"
+        axs[0, j].set_title(t0, fontsize=9); axs[1, j].set_title(t1, fontsize=9)
+    for a in axs.ravel():
+        a.axis('off')
+    plt.tight_layout()
+    if mascara is None:
+        print("(No se pudo segmentar la pupila: no se calcula la continuidad; mirá las figuras.)")
+ 
+    # ---------------- 1.3.2 TFD-2D ----------------
+    magA, faseA = _tfd(gris)
     fig3, axs3 = plt.subplots(1, 3, figsize=(15, 5))
-
-    axs3[0].imshow(roi_gris, cmap='gray', vmin=0, vmax=255)
-    axs3[0].set_title('ROI Original')
-
-    axs3[1].imshow(espectro_magnitud, cmap='gray')
-    axs3[1].set_title('Espectro de Magnitud')
-
-    axs3[2].imshow(espectro_fase, cmap='gray')
-    axs3[2].set_title('Espectro de Fase')
-
+    axs3[0].imshow(gris, cmap='gray'); axs3[0].set_title('ROI original')
+    axs3[1].imshow(np.fft.fftshift(20 * np.log10(magA + 1)), cmap='gray'); axs3[1].set_title('Magnitud (dB, escala log)')
+    axs3[2].imshow(np.fft.fftshift(faseA), cmap='gray'); axs3[2].set_title('Fase (rad)')
+    for a in axs3:
+        a.axis('off')
     plt.tight_layout()
-    plt.show()
-
-    # Ahora realizamos la reconstrucción de la imagen
-    f = np.fft.fft2(roi_gris)
-    fshift = np.fft.fftshift(f)
-    mag = np.abs(fshift)
-    phase = np.angle(fshift)
-
-    f_solo_mag = mag * np.exp(1j * np.zeros_like(phase))
-    img_recon_mag = np.abs(np.fft.ifft2(np.fft.ifftshift(f_solo_mag)))
-
-    f_solo_phase = np.ones_like(mag) * np.exp(1j * phase)
-    img_recon_phase = np.abs(np.fft.ifft2(np.fft.ifftshift(f_solo_phase)))
-
-    roi_suavizada = cv2.GaussianBlur(roi_gris, (5, 5), 0)
-    f_suav = np.fft.fft2(roi_suavizada)
-    mag_suav = np.abs(np.fft.fftshift(f_suav))
-    
-    f_cruzada = mag_suav * np.exp(1j * phase)
-    img_recon_cruzada = np.abs(np.fft.ifft2(np.fft.ifftshift(f_cruzada)))
-
-    fig, axs = plt.subplots(1, 4, figsize=(16, 5))
-    axs[0].imshow(roi_gris, cmap='gray', vmin=0, vmax=255)
-    axs[0].set_title('Original')
-    axs[1].imshow(img_recon_mag, cmap='gray')
-    axs[1].set_title('Solo Magnitud')
-    axs[2].imshow(img_recon_phase, cmap='gray')
-    axs[2].set_title('Solo Fase')
-    axs[3].imshow(img_recon_cruzada, cmap='gray')
-    axs[3].set_title('Cruzada (Mag Suav + Fase Orig)')
+ 
+    if frame_otro is not None:
+        otra = cv2.cvtColor(np.ascontiguousarray(frame_otro[y:y + h, x:x + w]), cv2.COLOR_BGR2GRAY)
+        nombre_B = 'Otro frame'
+    else:
+        from skimage import data
+        otra = cv2.resize(data.camera(), (gris.shape[1], gris.shape[0]), interpolation=cv2.INTER_AREA)
+        nombre_B = 'Imagen distinta (cameraman)'
+    magB, faseB = _tfd(otra)
+    r_mag = _recon(magA, np.zeros_like(faseA))
+    r_fase = _recon(np.ones_like(magA), faseA)
+    r_AmagBfase = _recon(magA, faseB)
+    r_BmagAfase = _recon(magB, faseA)
+    fig4, axs4 = plt.subplots(2, 4, figsize=(17, 8.5))
+    paneles = [('A: original', gris), (f'B: {nombre_B}', otra), ('A: solo magnitud', r_mag), ('A: solo fase', r_fase),
+               ('Magnitud de A + fase de B', r_AmagBfase), ('Magnitud de B + fase de A', r_BmagAfase)]
+    for a, (t, im) in zip(axs4.ravel(), paneles):
+        a.imshow(_norm_vis(im) if 'solo' in t or '+' in t else im, cmap='gray'); a.set_title(t); a.axis('off')
+    axs4[1, 2].axis('off'); axs4[1, 3].axis('off')
     plt.tight_layout()
+    grad = lambda im: cv2.magnitude(cv2.Sobel(im.astype(np.float32), cv2.CV_32F, 1, 0), cv2.Sobel(im.astype(np.float32), cv2.CV_32F, 0, 1))
+    print("\n1.3.2 Correlación de cada reconstrucción con las imágenes originales (1 = idéntica):")
+    print(f"   Solo magnitud de A      -> con A: {_corr(r_mag, gris):+.2f} | con los BORDES de A: {_corr(np.abs(r_mag - r_mag.mean()), grad(gris)):+.2f}")
+    print(f"   Solo fase de A          -> con A: {_corr(r_fase, gris):+.2f} | con los BORDES de A: {_corr(np.abs(r_fase - r_fase.mean()), grad(gris)):+.2f}")
+    print(f"   Magnitud A + fase B     -> con A: {_corr(r_AmagBfase, gris):+.2f} | con B: {_corr(r_AmagBfase, otra):+.2f}")
+    print(f"   Magnitud B + fase A     -> con A: {_corr(r_BmagAfase, gris):+.2f} | con B: {_corr(r_BmagAfase, otra):+.2f}")
+ 
+    # ---------------- 1.3.3 PSD antes y después del filtrado espacial ----------------
+    imagenes = {'Original': gris, 'Media 5x5': cv2.blur(gris, (5, 5)),
+                'Mediana 5x5': cv2.medianBlur(gris, 5), 'Gaussiano 5x5': suave}
+    fig5, (axp, axq) = plt.subplots(1, 2, figsize=(15, 5.5))
+    print("\n1.3.3 Fracción de la potencia (sin componente continua) en altas frecuencias (> 0.1 ciclos/píxel):")
+    for nombre, im in imagenes.items():
+        f, psd, P = _psd_radial(im)
+        axp.loglog(f[1:], psd[1:], label=nombre)
+        total = psd[1:] * np.arange(1, len(psd))                    # potencia por anillo (aprox.)
+        alta = total[f[1:] > 0.1].sum() / total.sum()
+        print(f"   {nombre:<15} {100 * alta:6.2f} %")
+    axp.set_xlabel('Frecuencia (ciclos/píxel)'); axp.set_ylabel('PSD radial'); axp.grid(True, which='both', alpha=0.4)
+    axp.set_title('PSD radial antes y después del filtrado espacial'); axp.legend()
+    _, _, P0 = _psd_radial(gris)
+    _, _, P1 = _psd_radial(suave)
+    axq.imshow(np.log10(P0 + 1) - np.log10(P1 + 1), cmap='magma')
+    axq.set_title('log PSD(original) - log PSD(gaussiano): dónde se perdió potencia'); axq.axis('off')
+    plt.tight_layout()
+ 
+    # ---------------- 1.3.4 Filtrado en frecuencia ----------------
+    # Gaussiana de sigma_filtro en espacio <-> H(f) = exp(-2 pi^2 sigma^2 f^2) en frecuencia (par de Fourier)
+    fc = np.sqrt(np.log(np.sqrt(2)) / (2 * np.pi ** 2 * sigma_filtro ** 2))   # frecuencia de corte a -3 dB
+    lp_gauss = _filtrar_frecuencia(gris, lambda f: np.exp(-2 * np.pi ** 2 * sigma_filtro ** 2 * f ** 2))
+    hp_gauss = _filtrar_frecuencia(gris, lambda f: 1 - np.exp(-2 * np.pi ** 2 * sigma_filtro ** 2 * f ** 2))
+    lp_ideal = _filtrar_frecuencia(gris, lambda f: (f <= fc).astype(float))
+    esp_gauss = cv2.GaussianBlur(gris, (0, 0), sigma_filtro, borderType=cv2.BORDER_REFLECT)
+    u8 = lambda a: np.clip(a, 0, 255).astype(np.uint8)
+    lp_gauss8, lp_ideal8 = u8(lp_gauss), u8(lp_ideal)
+    fig6, axs6 = plt.subplots(2, 3, figsize=(15, 10))
+    paneles = [('Original', gris), (f'Pasa-bajos gaussiano (frecuencia), fc={fc:.3f} c/px', lp_gauss8),
+               (f'Pasa-bajos IDEAL, fc={fc:.3f} c/px', lp_ideal8),
+               (f'Filtro gaussiano ESPACIAL sigma={sigma_filtro:g}', esp_gauss),
+               ('Pasa-altos gaussiano (detalle/bordes)', _norm_vis(hp_gauss)),
+               ('|Pasa-bajos frecuencia - espacial| x20', np.clip(np.abs(lp_gauss8.astype(float) - esp_gauss) * 20, 0, 255))]
+    for a, (t, im) in zip(axs6.ravel(), paneles):
+        a.imshow(im, cmap='gray'); a.set_title(t, fontsize=9); a.axis('off')
+    plt.tight_layout()
+    print(f"\n1.3.4 Filtros en frecuencia (corte fc = {fc:.3f} ciclos/píxel, equivalente a un gaussiano espacial de sigma = {sigma_filtro:g}):")
+    print(f"   Pasa-bajos gaussiano (frecuencia) vs. gaussiano espacial: PSNR = {psnr(esp_gauss, lp_gauss8, data_range=255):.1f} dB | "
+          f"SSIM = {ssim(esp_gauss, lp_gauss8, data_range=255):.4f}")
+    print(f"   Contra la original -> PB gaussiano: PSNR {psnr(gris, lp_gauss8, data_range=255):.1f} dB / SSIM {ssim(gris, lp_gauss8, data_range=255):.3f} | "
+          f"PB ideal: PSNR {psnr(gris, lp_ideal8, data_range=255):.1f} dB / SSIM {ssim(gris, lp_ideal8, data_range=255):.3f}")
+    print("   (El pasa-bajos ideal corta de golpe y genera 'anillos' (ringing) alrededor de los bordes; el gaussiano no.)")
     plt.show()
+ 
 
     # La fase es la que conserva la información estructural
     
 # -------------------------------------------------------------------------------------
 # MÓDULO 2
 # -------------------------------------------------------------------------------------
+def _poligono_a_mascara(contorno_rc, shape):
+    """Contorno del snake (filas, columnas) -> máscara 0/255."""
+    m = np.zeros(shape, np.uint8)
+    pts = np.round(np.asarray(contorno_rc)[:, ::-1]).astype(np.int32)
+    cv2.fillPoly(m, [pts], 255)
+    return m
+ 
+ 
+def anotar_contorno_manual(roi, ruta_salida='referencia_pupila.png', forma='elipse', escala=2):
+    """
+    Herramienta para dibujar a mano el contorno de la pupila sobre la ROI:
+      clic izquierdo = agregar punto (poné 12-20 puntos sobre el borde) | z = deshacer | Enter = terminar | Esc = cancelar
+    forma='elipse' ajusta una elipse a tus puntos; forma='poligono' rellena el polígono que unen.
+    Guarda una máscara PNG (blanco = pupila) con el tamaño exacto de la ROI.
+    """
+    puntos = []
+    ventana = 'Anotar pupila: clic=punto | z=deshacer | Enter=terminar | Esc=cancelar'
+    base = cv2.resize(roi, None, fx=escala, fy=escala, interpolation=cv2.INTER_CUBIC)
+ 
+    def click(ev, px, py, flags, param):
+        if ev == cv2.EVENT_LBUTTONDOWN:
+            puntos.append((px / escala, py / escala))
+ 
+    cv2.namedWindow(ventana)
+    cv2.setMouseCallback(ventana, click)
+    while True:
+        vis = base.copy()
+        for (px, py) in puntos:
+            cv2.circle(vis, (int(px * escala), int(py * escala)), 3, (0, 255, 0), -1)
+        if len(puntos) >= 2:
+            cv2.polylines(vis, [np.round(np.array(puntos) * escala).astype(np.int32)], len(puntos) >= 3, (0, 255, 0), 1)
+        cv2.imshow(ventana, vis)
+        k = cv2.waitKey(20) & 0xFF
+        if k == 13 and len(puntos) >= 8:
+            break
+        if k == ord('z') and puntos:
+            puntos.pop()
+        if k == 27:
+            cv2.destroyAllWindows()
+            print("Anotación cancelada.")
+            return None
+    cv2.destroyAllWindows()
+    m = np.zeros(roi.shape[:2], np.uint8)
+    pts = np.array(puntos, np.float32)
+    if forma == 'elipse':
+        cv2.ellipse(m, cv2.fitEllipse(pts), 255, -1)
+    else:
+        cv2.fillPoly(m, [np.round(pts).astype(np.int32)], 255)
+    cv2.imwrite(ruta_salida, m)
+    print(f"Referencia guardada en '{ruta_salida}' ({int((m > 0).sum())} px).")
+    return m
+ 
+ 
+def guardar_roi_para_anotar(roi, ruta='roi_para_anotar.png'):
+    """Si preferís anotar en ImageJ: guarda la ROI exacta; dibujá la pupila, Edit > Selection > Create Mask y guardá como referencia_pupila.png."""
+    cv2.imwrite(ruta, roi)
+    print(f"ROI guardada en '{ruta}'. Anotala y guardá la máscara como 'referencia_pupila.png' (blanco = pupila, mismo tamaño).")
+ 
+ 
+def _mayor_componente(mascara):
+    n, et, st, _ = cv2.connectedComponentsWithStats((mascara > 0).astype(np.uint8), 8)
+    if n <= 1:
+        return np.zeros(mascara.shape, bool)
+    return et == (1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA])))
+ 
+ 
+def _dice_iou(a, b):
+    inter = np.logical_and(a, b).sum()
+    union = np.logical_or(a, b).sum()
+    s = a.sum() + b.sum()
+    return (2.0 * inter / s if s else 0.0), (inter / union if union else 0.0)
+ 
+ 
+def procesar_modulo_2_3(roi, mascaras, ruta_ref='referencia_pupila.png', area_min_px=250, area_max_px=2000):
+    print("\n" + "=" * 70)
+    print("--- 2.3 Comparación de máscaras contra la referencia manual (Dice / IoU) ---")
+    print("=" * 70)
+    if not os.path.exists(ruta_ref):
+        print(f"No existe '{ruta_ref}'. Creala con anotar_contorno_manual(roi) o con guardar_roi_para_anotar(roi) + ImageJ.")
+        return None
+    ref = cv2.imread(ruta_ref, cv2.IMREAD_GRAYSCALE)
+    if ref is None or ref.shape != roi.shape[:2]:
+        print(f"La referencia debe tener el tamaño de la ROI {roi.shape[1]}x{roi.shape[0]} px.")
+        return None
+    ref = ref > 127
+    if ref.mean() > 0.5:      # ImageJ a veces guarda la máscara invertida (pupila negra): se corrige sola
+        ref = ~ref
+        print("Aviso: la referencia venía invertida (pupila en negro); se invirtió automáticamente.")
+    if ref.sum() == 0:
+        print("La referencia está vacía (no hay píxeles blancos): revisá el archivo.")
+        return None
+    cand = dict(mascaras)
+    m_el, _ = _mascara_pupila_elipse(roi, area_min_px, area_max_px)
+    if m_el is not None:
+        cand['Elipse por gradiente (Módulo 3.2)'] = m_el
+ 
+    filas = []
+    for nombre, m in cand.items():
+        b = m > 0
+        d_all, i_all = _dice_iou(b, ref)
+        c = _mayor_componente(m)
+        d_c, i_c = _dice_iou(c, ref)
+        filas.append(dict(nombre=nombre, dice=d_all, iou=i_all, dice_c=d_c, iou_c=i_c,
+                          area=int(b.sum()), err=100 * (int(b.sum()) - int(ref.sum())) / ref.sum(), masc=c))
+    print(f"Área de la referencia manual: {int(ref.sum())} px")
+    print(f"{'Método':<34}{'Dice':>7}{'IoU':>7}{'Dice (mayor comp.)':>20}{'IoU (mayor comp.)':>19}{'Área':>8}{'Error área':>12}")
+    for f in sorted(filas, key=lambda f: -f['dice_c']):
+        print(f"{f['nombre']:<34}{f['dice']:>7.3f}{f['iou']:>7.3f}{f['dice_c']:>20.3f}{f['iou_c']:>19.3f}{f['area']:>8d}{f['err']:>+11.1f}%")
+ 
+    seg = [f for f in filas if f['nombre'] in ('Otsu', 'K-Means', 'Snake', 'Watershed')]
+    mor = [f for f in filas if f['nombre'] in ('Umbral<45', 'Erosión', 'Dilatación', 'Apertura', 'Cierre', 'Cierre+Apertura (final)')]
+    if seg:
+        b = max(seg, key=lambda f: f['dice_c'])
+        print(f"\n-> Mejor método de segmentación (2.1): {b['nombre']} (Dice {b['dice_c']:.3f}).")
+    if mor:
+        b = max(mor, key=lambda f: f['dice_c'])
+        print(f"-> Mejor operación/combinación morfológica (2.2): {b['nombre']} (Dice {b['dice_c']:.3f}).")
+        ero = [f for f in mor if f['nombre'] == 'Erosión']
+        dil = [f for f in mor if f['nombre'] == 'Dilatación']
+        if ero and dil:
+            print(f"   La erosión cambia el área {ero[0]['err']:+.1f} % y la dilatación {dil[0]['err']:+.1f} % respecto de la referencia.")
+ 
+    # Figura: contorno de la referencia (verde) vs. contorno de cada máscara (rojo)
+    gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    ys, xs = np.nonzero(ref)
+    r = int(2.4 * np.sqrt(ref.sum() / np.pi))
+    y0, x0 = max(0, int(ys.mean()) - r), max(0, int(xs.mean()) - r)
+    sl = (slice(y0, y0 + 2 * r), slice(x0, x0 + 2 * r))
+    n = len(filas)
+    cols = 4
+    fig, axs = plt.subplots(int(np.ceil(n / cols)), cols, figsize=(4 * cols, 4 * int(np.ceil(n / cols))))
+    for a in np.atleast_1d(axs).ravel():
+        a.axis('off')
+    for a, f in zip(np.atleast_1d(axs).ravel(), sorted(filas, key=lambda f: -f['dice_c'])):
+        a.imshow(gris[sl], cmap='gray')
+        a.contour(ref[sl], levels=[0.5], colors='lime', linewidths=1.5)
+        if f['masc'].any():
+            a.contour(f['masc'][sl], levels=[0.5], colors='red', linewidths=1.2)
+        a.set_title(f"{f['nombre']}\nDice {f['dice_c']:.3f}", fontsize=9)
+    plt.suptitle('Verde = referencia manual | Rojo = máscara del método (mayor componente)')
+    plt.tight_layout()
+    plt.show()
+    return filas
 
 def procesar_modulo_2(roi):
     # Extraemos los canales y nos quedamos solo con el Rojo (R)
@@ -468,77 +882,133 @@ def procesar_modulo_2(roi):
     plt.show()
     
     
-    return mascara_limpia
+    mascaras = {
+               'Otsu': mascara_otsu, 'K-Means': mascara_kmeans,
+               'Snake': _poligono_a_mascara(snake, roi.shape[:2]),
+               'Watershed': ((marcadores > 1).astype(np.uint8) * 255),
+               'Umbral<45': mascara_base, 'Erosión': erosion, 'Dilatación': dilatacion,
+               'Apertura': apertura, 'Cierre': cierre, 'Cierre+Apertura (final)': mascara_limpia,
+           }
+    return mascara_limpia, mascaras
 
 # -------------------------------------------------------------------------------------
 # MÓDULO 3.1
 # -------------------------------------------------------------------------------------
 
-def procesar_modulo_3_1(roi, mascara_limpia):
-    """
-    Extracción de Descriptores Morfométricos y de Textura en el frame segmentado.
-    Requiere que procesar_modulo_2() retorne 'mascara_limpia'.
-    """
-    # 1. Descriptores Morfométricos (Forma)
+def _glcm_region(canal, region, niveles=32):
+    """GLCM (distancia 1, 4 ángulos) usando solo los píxeles de 'region' (no se cuentan pares con píxeles de afuera)."""
+    ys, xs = np.nonzero(region)
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    q = (canal[y0:y1, x0:x1] // (256 // niveles)).astype(np.uint8)
+    q[~region[y0:y1, x0:x1]] = niveles                              # nivel reservado para "fuera de la región"
+    g = graycomatrix(q, distances=[1], angles=[0, np.pi / 4, np.pi / 2, 3 * np.pi / 4],
+                     levels=niveles + 1, symmetric=True, normed=False).astype(np.float64)
+    g[niveles, :, :, :] = 0
+    g[:, niveles, :, :] = 0
+    g /= np.maximum(g.sum(axis=(0, 1), keepdims=True), 1)
+    return {k: float(graycoprops(g, k).mean()) for k in ('contrast', 'homogeneity', 'energy', 'correlation')}
+
+
+def procesar_modulo_3_1(roi, mascara_limpia, factor_iris=2.6, usar_elipse=False):
+    """usar_elipse=True: en vez de la máscara del Módulo 2 usa la pupila por gradiente/elipse del Módulo 3.2
+    (conviene si el Dice del 2.3 muestra que es mejor, y es más robusto con videos nuevos)."""
+    if usar_elipse:
+        m_el, _ = _mascara_pupila_elipse(roi)
+        if m_el is not None:
+            mascara_limpia = m_el
+        else:
+            print("No se pudo segmentar con el método por gradiente; se usa la máscara del Módulo 2.")
     contornos, _ = cv2.findContours(mascara_limpia, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contornos:
         print("No se detectó pupila en la máscara.")
         return
-        
     c = max(contornos, key=cv2.contourArea)
     area = cv2.contourArea(c)
     perimetro = cv2.arcLength(c, True)
-    
     M = cv2.moments(c)
-    cX = int(M["m10"] / M["m00"]) if M["m00"] != 0 else 0
-    cY = int(M["m01"] / M["m00"]) if M["m00"] != 0 else 0
-    
-    # Estimación de circularidad
-    circularidad = (4 * np.pi * area) / (perimetro ** 2) if perimetro > 0 else 0
-    
-    print("\n--- 3.1.1 Descriptores Morfométricos ---")
-    print(f"Área (A): {area} px")
-    print(f"Perímetro (P): {perimetro:.2f} px")
-    print(f"Centroide (X_c, Y_c): ({cX}, {cY})")
-    print(f"Circularidad: {circularidad:.4f}")
+    cX = M["m10"] / M["m00"] if M["m00"] else 0.0
+    cY = M["m01"] / M["m00"] if M["m00"] else 0.0
+    circ = (4 * np.pi * area) / (perimetro ** 2) if perimetro > 0 else 0
+    excentricidad = np.nan
+    if len(c) >= 5:
+        (_, _), (d1, d2), _ = cv2.fitEllipse(c)
+        a_, b_ = max(d1, d2) / 2, min(d1, d2) / 2
+        excentricidad = float(np.sqrt(max(1 - (b_ / a_) ** 2, 0)))
 
-    # 2. Textura de Primer Orden (Estadística Global)
+    print("\n--- 3.1.1 Descriptores Morfométricos ---")
+    print(f"Área (A): {area:.0f} px²  (diámetro equivalente {2 * np.sqrt(area / np.pi):.1f} px)")
+    print(f"Perímetro (P): {perimetro:.2f} px")
+    print(f"Centroide (X_c, Y_c): ({cX:.1f}, {cY:.1f})")
+    print(f"Circularidad: {circ:.4f} (1 = círculo perfecto) | Excentricidad: {excentricidad:.3f} (0 = círculo)")
+
+    # Regiones: pupila (mayor contorno) e iris (anillo, sin destellos)
+    pup = np.zeros(mascara_limpia.shape, np.uint8)
+    cv2.drawContours(pup, [c], -1, 255, -1)
+    pup = pup > 0
+    gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    yy, xx = np.indices(gris.shape)
+    d = np.hypot(xx - cX, yy - cY)
+    r_eq = np.sqrt(area / np.pi)
+    iris = (d >= 1.25 * r_eq) & (d <= factor_iris * r_eq) & (gris < 235)
+    regiones = {'Pupila': pup, 'Iris (anillo)': iris}
+
+    vis = roi.copy()
+    vis[iris] = (0.5 * vis[iris] + 0.5 * np.array([0, 255, 0])).astype(np.uint8)
+    vis[pup] = (0.5 * vis[pup] + 0.5 * np.array([0, 0, 255])).astype(np.uint8)
+    plt.figure(figsize=(5, 5))
+    plt.imshow(vis[..., ::-1]); plt.axis('off')
+    plt.title('Regiones: pupila (rojo) e iris (verde)\nSi el verde invade esclerótica/piel, bajá factor_iris')
+    plt.tight_layout()
+    plt.show()
+
     b, g, r = cv2.split(roi)
     canales = {'Rojo (R)': r, 'Verde (G)': g, 'Azul (B)': b}
-    
-    print("\n--- 3.1.2 Textura de Primer Orden ---")
-    for nombre, canal in canales.items():
-        # Extraer solo píxeles dentro de la ROI segmentada (pupila/iris)
-        pixeles = canal[mascara_limpia > 0]
-        if len(pixeles) == 0:
-            continue
-            
-        media = np.mean(pixeles)
-        desvio = np.std(pixeles)
-        asimetria = skew(pixeles)
-        
-        hist, _ = np.histogram(pixeles, bins=256, range=(0,256), density=True)
-        ent = entropy(hist + 1e-9) # 1e-9 para evitar log(0)
-        
-        print(f"{nombre} -> Media: {media:.2f} | Std: {desvio:.2f} | Skewness: {asimetria:.2f} | Entropía: {ent:.2f}")
 
-    # 3. Textura de Segundo Orden (GLCM)
-    print("\n--- 3.1.3 Textura de Segundo Orden (GLCM) ---")
-    for nombre, canal in canales.items():
-        # Cuantización a 32 niveles de gris
-        canal_cuantizado = (canal // 8).astype(np.uint8)
-        
-        # Calcular GLCM (distancia=1, 4 ángulos)
-        glcm = graycomatrix(canal_cuantizado, distances=[1], angles=[0, np.pi/4, np.pi/2, 3*np.pi/4], 
-                            levels=32, symmetric=True, normed=True)
-        
-        contraste = graycoprops(glcm, 'contrast').mean()
-        homogeneidad = graycoprops(glcm, 'homogeneity').mean()
-        energia = graycoprops(glcm, 'energy').mean()
-        correlacion = graycoprops(glcm, 'correlation').mean()
-        
-        print(f"{nombre} -> Contraste: {contraste:.4f} | Homogeneidad: {homogeneidad:.4f} | Energía: {energia:.4f} | Correlación: {correlacion:.4f}")
+    print("\n--- 3.1.2 Textura de Primer Orden (por región y canal) ---")
+    entropia_iris = {}
+    for reg_nombre, reg in regiones.items():
+        print(f"[{reg_nombre}]  ({int(reg.sum())} px)")
+        for nombre, canal in canales.items():
+            px = canal[reg]
+            if px.size == 0:
+                continue
+            hist, _ = np.histogram(px, bins=256, range=(0, 256), density=True)
+            ent = float(entropy(hist + 1e-12, base=2))
+            if reg_nombre.startswith('Iris'):
+                entropia_iris[nombre] = ent
+            print(f"   {nombre:<10} Media: {px.mean():6.2f} | Std: {px.std():6.2f} | "
+                  f"Skewness: {skew(px):6.2f} | Entropía: {ent:5.2f} bits")
 
+    print("\n--- 3.1.3 Textura de Segundo Orden (GLCM, 32 niveles) en el IRIS ---")
+    glcm = {}
+    for nombre, canal in canales.items():
+        glcm[nombre] = _glcm_region(canal, iris)
+        v = glcm[nombre]
+        print(f"   {nombre:<10} Contraste: {v['contrast']:7.3f} | Homogeneidad: {v['homogeneity']:.4f} | "
+              f"Energía: {v['energy']:.4f} | Correlación: {v['correlation']:.4f}")
+
+    # Ranking de "riqueza textural": más entropía y contraste, menos homogeneidad y energía
+    nombres = list(canales)
+    def rango(valores, mayor_es_mejor):
+        orden = sorted(nombres, key=lambda n: valores[n], reverse=mayor_es_mejor)
+        return {n: orden.index(n) + 1 for n in nombres}
+    rankings = {
+        'entropía': rango(entropia_iris, True),
+        'contraste': rango({n: glcm[n]['contrast'] for n in nombres}, True),
+        'homogeneidad (menor=más textura)': rango({n: glcm[n]['homogeneity'] for n in nombres}, False),
+        'energía (menor=más textura)': rango({n: glcm[n]['energy'] for n in nombres}, False),
+    }
+    puntaje = {n: sum(rk[n] for rk in rankings.values()) for n in nombres}
+    ganador = min(puntaje, key=puntaje.get)
+    peor = max(puntaje, key=puntaje.get)
+    print("\nPosición de cada canal (1 = más textura) -> " +
+          " | ".join(f"{n}: {puntaje[n]} pts" for n in nombres) + "  (menos puntos = más textura)")
+    if puntaje[ganador] == puntaje[peor]:
+        print("-> Los tres canales dan lo mismo (¿la imagen es en escala de grises?): no hay un canal con más textura.")
+    else:
+        print(f"-> Canal con mayor riqueza textural del estroma iridiano: {ganador}. El de menor riqueza: {peor}.")
+    print("   (Una textura rica = más entropía y contraste, y menos homogeneidad y energía. Ojo: la cuantización usa niveles "
+          "absolutos, así que un canal muy oscuro usa pocos niveles y parece menos texturado.)")
 
 # --------------------------------------------------------------
 # MÓDULO 3.2
@@ -680,24 +1150,83 @@ def _centro_inicial(c_img, par):
     return np.array(min_loc, dtype=float)
  
  
-def _roi_estable(video_path, fps, t_inicio, n_frames=8):
-    """ROI automática usando la mediana de varios frames (más estable que usar solo el primero)."""
+def _candidatos_roi(frame, k=8):
+    """Las k zonas más oscuras del frame (separadas entre sí): posibles ubicaciones de la pupila."""
+    gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gris, (15, 15), 0).astype(np.float32)
+    alto, ancho = gris.shape
+    lado = int(min(ancho, alto) * 0.4)
+    cands = []
+    for _ in range(k):
+        _, _, (cx, cy), _ = cv2.minMaxLoc(blur)
+        x = int(np.clip(cx - lado // 2, 0, ancho - lado))
+        y = int(np.clip(cy - lado // 2, 0, alto - lado))
+        cands.append((x, y, lado, lado))
+        cv2.circle(blur, (int(cx), int(cy)), max(lado // 2, 1), 255, -1)   # anular una ROI entera para buscar la siguiente
+    return cands
+
+
+def _roi_estable(video_path, fps, t_inicio, t_fin, par, canal, n_muestras=10):
+    """
+    Elige la ROI probando varias zonas oscuras de frames repartidos por todo el análisis y quedándose con la
+    que tiene una pupila detectable en más frames (el punto más oscuro del frame NO siempre es la pupila).
+    Devuelve (x, y, w, h, mensaje) o None.
+    """
     cap = cv2.VideoCapture(video_path)
-    rois, idx = [], -1
-    while len(rois) < n_frames:
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    i0 = int(round(t_inicio * fps))
+    if total <= 0:
+        i1 = i0 + int(10 * fps)
+    else:
+        i1 = total - 1
+    if t_fin is not None and np.isfinite(t_fin):
+        i1 = min(i1, int(round(t_fin * fps)))
+    objetivos = set(np.linspace(i0, max(i0, i1), n_muestras).astype(int).tolist())
+    muestras, idx = [], -1
+    while idx < i1:
         ret, frame = cap.read()
         if not ret:
             break
         idx += 1
-        if idx / fps < t_inicio:
-            continue
-        rois.append(obtener_roi_automatica(frame))
+        if idx in objetivos:
+            muestras.append(frame)
     cap.release()
-    if not rois:
+    if not muestras:
         return None
-    rois = np.array(rois)
-    x, y = int(np.median(rois[:, 0])), int(np.median(rois[:, 1]))
-    return x, y, int(rois[0, 2]), int(rois[0, 3])
+
+    # Agrupar candidatos parecidos de todos los frames de prueba
+    lado = _candidatos_roi(muestras[0], 1)[0][2]
+    grupos = []                                            # cada grupo: lista de (x, y)
+    for fr in muestras:
+        for (x, y, _, _) in _candidatos_roi(fr):
+            for g in grupos:
+                gx, gy = np.median([q[0] for q in g]), np.median([q[1] for q in g])
+                if abs(x - gx) < lado / 2 and abs(y - gy) < lado / 2:
+                    g.append((x, y))
+                    break
+            else:
+                grupos.append([(x, y)])
+
+    mejor, mejor_clave = None, (-1, -1)
+    for g in grupos:
+        x, y = int(np.median([q[0] for q in g])), int(np.median([q[1] for q in g]))
+        ok = 0
+        for fr in muestras:
+            c_img = np.ascontiguousarray(fr[y:y + lado, x:x + lado][:, :, canal]) if canal in (0, 1, 2) else \
+                np.ascontiguousarray(cv2.cvtColor(fr[y:y + lado, x:x + lado], cv2.COLOR_BGR2GRAY))
+            r = _medir_pupila(c_img, _centro_inicial(c_img, par), par)
+            if r is not None and r['calidad'] >= 0.4:
+                ok += 1
+        clave = (ok, len(g))
+        if clave > mejor_clave:
+            mejor, mejor_clave = (x, y), clave
+    x, y = mejor
+    if mejor_clave[0] == 0:
+        msg = ("ADVERTENCIA: no se encontró una pupila clara en ninguna zona candidata; se usa la zona más oscura. "
+               "Pasá roi_manual=(x, y, w, h) con la ROI del Módulo 1.")
+    else:
+        msg = f"ROI elegida automáticamente: pupila detectable en {mejor_clave[0]} de {len(muestras)} frames de prueba."
+    return x, y, lado, lado, msg
  
  
 def _recorte_visual(roi, centro, res, par):
@@ -854,8 +1383,8 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
     """
     if t_fin is None:
         t_fin = float('inf')
-    print(f"\n--- 3.2 Procesando video ({etiqueta}) ---")
- 
+    print(f"\n--- 3.2 Procesando video ({etiqueta}) --- [versión 3.2 final v4]")
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print("No se pudo abrir el video.")
@@ -864,24 +1393,26 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
     cap.release()
     if not fps or fps <= 0 or np.isnan(fps):
         fps = 30.0
- 
+
     # ---- ROI ----
+    par = _parametros_segmentacion(area_min_px, area_max_px)
     if roi_manual is not None:
         x, y, w, h = roi_manual
     else:
-        roi_info = _roi_estable(video_path, fps, t_inicio)
+        roi_info = _roi_estable(video_path, fps, t_inicio, t_fin, par, canal)
         if roi_info is None:
             print("No se pudo determinar la ROI.")
             return None
-        x, y, w, h = roi_info
-    par = _parametros_segmentacion(area_min_px, area_max_px)
+        x, y, w, h, msg_roi = roi_info
+        print(msg_roi)
     print(f"FPS: {fps:.2f} | ROI: x={x}, y={y}, w={w}, h={h} | rango de área válido: {area_min_px}-{area_max_px} px²")
- 
+
     # ---- Frame a frame ----
     cap = cv2.VideoCapture(video_path)
     tiempos, brillos, areas, calidades, visuales = [], [], [], [], []
     frames_idx = []
     centro, centro_ref, fallos = None, None, 0
+    frame_ref = None
     frame_idx = -1
     while True:
         ret, frame = cap.read()
@@ -893,17 +1424,19 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
             continue
         if t > t_fin:
             break
- 
+
+        if frame_ref is None:
+            frame_ref = frame.copy()
         gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         brillos.append(cv2.mean(gris)[0])                # brillo global -> detecta el apagado del flash
- 
+
         roi = frame[y:y + h, x:x + w]
         c_img = np.ascontiguousarray(roi[:, :, canal]) if canal in (0, 1, 2) else np.ascontiguousarray(gris[y:y + h, x:x + w])
- 
+
         if centro is None:
             centro = _centro_inicial(c_img, par)
             centro_ref = centro.copy()
- 
+
         res = _medir_pupila(c_img, centro, par)
         if res is not None:
             centro = np.array(res['centro'])
@@ -916,31 +1449,41 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
             calidades.append(0.0)
             if fallos >= 10:                             # se perdió el seguimiento: volver al centro inicial
                 centro = centro_ref.copy()
- 
+
         visuales.append(_recorte_visual(roi, centro, res, par))
         tiempos.append(t)
         frames_idx.append(frame_idx)
     cap.release()
- 
+
     if len(areas) < 10:
         print("Muy pocos frames dentro de la ventana de análisis.")
         return None
- 
+
     t = np.array(tiempos)
     a_cruda = np.array(areas, dtype=float)
     brillo = np.array(brillos, dtype=float)
- 
+
+    frac_fallo = float(np.isnan(a_cruda).mean())
+    if frac_fallo > 0.4:
+        print(f"ADVERTENCIA: la pupila no se detectó en el {100 * frac_fallo:.0f} % de los frames. Lo más probable es que la ROI "
+              f"(x={x}, y={y}, {w}x{h}) no esté sobre el ojo: pasá roi_manual=(x, y, w, h) con la ROI del Módulo 1. "
+              f"Si la ROI es correcta, revisá area_min_px/area_max_px.")
+
     # ---- Limpieza de artefactos ----
+    falla = False
     a_limpia, a_suave, es_art = _limpiar_serie(a_cruda, fps)
     if a_limpia is None:
-        print("La segmentación falló en casi todos los frames. Revisá la ROI o el rango area_min_px/area_max_px.")
-        return None
+        print("ADVERTENCIA: la segmentación falló en casi todos los frames. Revisá la figura de verificación, "
+              "la ROI y el rango area_min_px/area_max_px.")
+        a_limpia = a_suave = np.full(len(t), np.nan)
+        es_art = np.isnan(a_cruda)
+        falla = True
     n_sin_det = int(np.isnan(a_cruda).sum())
     n_hampel = int(es_art.sum() - n_sin_det)
     print(f"Frames analizados: {len(t)} | sin detección fiable (parpadeo/oclusión/baja confianza): {n_sin_det} "
           f"| atípicos (Hampel): {n_hampel} | interpolados en total: {int(es_art.sum())} "
           f"({100 * es_art.mean():.1f} %)")
- 
+
     # ---- Estímulo ----
     idx_forzado = int(np.argmin(np.abs(t - t_estimulo_manual))) if t_estimulo_manual is not None else None
     i_est, signo, fuerza = _detectar_estimulo(brillo, fps, idx_forzado)
@@ -949,21 +1492,23 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
     if t_estimulo_manual is None and fuerza < 0.03 * np.mean(brillo):
         print("ADVERTENCIA: el escalón de brillo es débil; verificá el instante del estímulo "
               "(podés forzarlo con t_estimulo_manual=...).")
- 
-    p = _extraer_parametros(t, a_suave, i_est, signo, fps)
-    if p is None:
-        print("No se observó respuesta pupilar posterior al estímulo.")
-        return None
- 
-    contraida = min(p['basal'], p['extremo'])
-    dilatada = max(p['basal'], p['extremo'])
+
+    p = None if falla else _extraer_parametros(t, a_suave, i_est, signo, fps)
+    if p is None and not falla:
+        print("ADVERTENCIA: no se observó respuesta pupilar posterior al estímulo "
+              "(revisá el instante del estímulo o forzalo con t_estimulo_manual=...).")
     nombre_resp = "Redilatación" if signo > 0 else "Constricción"
- 
+    if p is not None:
+        contraida = min(p['basal'], p['extremo'])
+        dilatada = max(p['basal'], p['extremo'])
+    else:
+        contraida = dilatada = np.nan
+
     # ---- Validación contra mediciones manuales ----
     # Si no se pasaron los niveles manuales, se toman de las anotaciones: promedio de las anotadas ANTES del
     # estímulo y de las anotadas DESPUÉS de completarse la respuesta (la menor es la contraída, la mayor la dilatada).
     niveles_de_anotaciones = False
-    if anotaciones_manuales and not (manual_contraida and manual_dilatada):
+    if p is not None and anotaciones_manuales and not (manual_contraida and manual_dilatada):
         pre = [a for fr, a in anotaciones_manuales.items() if fr in frames_idx and t[frames_idx.index(fr)] < t_est]
         post = [a for fr, a in anotaciones_manuales.items() if fr in frames_idx and t[frames_idx.index(fr)] >= p['t_ext']]
         if pre and post:
@@ -972,7 +1517,7 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
             niveles_de_anotaciones = True
     hay_manual = bool(manual_contraida) and bool(manual_dilatada)
     mae_niv = rmse_niv = np.nan
-    if hay_manual:
+    if hay_manual and p is not None:
         mae_niv, rmse_niv = _metricas_error([(contraida, manual_contraida), (dilatada, manual_dilatada)])
     mae_fr = rmse_fr = None
     tabla = []                                           # (frame, t, manual, auto, era_artefacto)
@@ -980,13 +1525,16 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
         for fr, a_man in sorted(anotaciones_manuales.items()):
             if fr in frames_idx:
                 k = frames_idx.index(fr)
-                tabla.append((fr, t[k], float(a_man), float(a_limpia[k]), bool(es_art[k])))
+                if np.isfinite(a_limpia[k]):
+                    tabla.append((fr, t[k], float(a_man), float(a_limpia[k]), bool(es_art[k])))
+                else:
+                    print(f"AVISO: el frame {fr} no tiene medición automática; no se compara.")
             else:
                 print(f"AVISO: el frame {fr} no está en la ventana analizada "
                       f"(frames {frames_idx[0]} a {frames_idx[-1]}); se ignora.")
         if tabla:
             mae_fr, rmse_fr = _metricas_error([(r[3], r[2]) for r in tabla])
- 
+
     # ---------------- Gráfico 1: curva temporal ----------------
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True,
                                    gridspec_kw={'height_ratios': [3, 1]})
@@ -1001,21 +1549,22 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
         ax1.plot([r[1] for r in tabla], [r[2] for r in tabla], 's', color='black', mfc='none',
                  ms=8, mew=1.5, label='Anotaciones manuales (ImageJ)')
     ax1.axvline(t_est, color='black', ls='--', label='Estímulo (cambio del flash)')
-    if not np.isnan(p['t_ini']):
-        ax1.axvline(p['t_ini'], color='green', ls='--', label=f"Inicio {nombre_resp.lower()}")
-    ax1.axvline(p['t_ext'], color='purple', ls='--', label=f"{nombre_resp} (95 % de la respuesta)")
+    if p is not None:
+        if not np.isnan(p['t_ini']):
+            ax1.axvline(p['t_ini'], color='green', ls='--', label=f"Inicio {nombre_resp.lower()}")
+        ax1.axvline(p['t_ext'], color='purple', ls='--', label=f"{nombre_resp} (95 % de la respuesta)")
     ax1.set_title(f'Dinámica Temporal de la Pupila - {etiqueta} ({tipo})')
     ax1.set_ylabel('Área pupilar (px²)')
     ax1.legend(fontsize=8, loc='best')
     ax1.grid(True)
- 
+
     ax2.plot(t, brillo, color='tab:green')
     ax2.axvline(t_est, color='black', ls='--')
     ax2.set_ylabel('Brillo medio\ndel frame')
     ax2.set_xlabel('Tiempo (s)')
     ax2.grid(True)
     plt.tight_layout()
- 
+
     # ---------------- Gráfico 2: verificación visual de la segmentación ----------------
     sel = np.linspace(0, len(t) - 1, 8).astype(int)
     fig2, axs = plt.subplots(2, 4, figsize=(12, 6.5))
@@ -1031,30 +1580,42 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
         ax.axis('off')
     fig2.suptitle('Verificación de la segmentación (elipse verde = pupila detectada)')
     plt.tight_layout()
+    if frac_fallo > 0.4 and frame_ref is not None:
+        fig3, ax3 = plt.subplots(figsize=(5, 5 * frame_ref.shape[0] / frame_ref.shape[1] + 0.5))
+        ax3.imshow(frame_ref[..., ::-1])
+        ax3.add_patch(Rectangle((x, y), w, h, fill=False, color='red', lw=2.5))
+        ax3.set_title('ROI usada (rojo). Si no está sobre el ojo,\npasá roi_manual=(x, y, w, h)', fontsize=10)
+        ax3.axis('off')
+        plt.tight_layout()
     if carpeta_salida:
         os.makedirs(carpeta_salida, exist_ok=True)
         base = os.path.join(carpeta_salida, "".join(c if c.isalnum() or c in "-_" else "_" for c in etiqueta))
         fig.savefig(base + "_curva.png", dpi=120)
         fig2.savefig(base + "_verificacion.png", dpi=120)
-    if mostrar:
-        plt.show()
-    else:
-        plt.close('all')
- 
+
+    def _mostrar_figuras():
+        if mostrar:
+            plt.show()
+        else:
+            plt.close('all')
+
     # ---------------- Reporte ----------------
     print(f"\n--- Parámetros Fisiológicos Extraídos ({etiqueta}: {tipo}) ---")
     print(f"Tiempo de estímulo: {t_est:.2f} s")
+    if p is None:
+        print("No se pudieron calcular los parámetros (ver advertencias arriba).")
     man_c = f"   | manual: {manual_contraida:.1f} px²" if hay_manual else ""
     man_d = f"   | manual: {manual_dilatada:.1f} px²" if hay_manual else ""
     man_a = f"   | manual: {manual_dilatada - manual_contraida:.1f} px²" if hay_manual else ""
-    print(f"Área contraída (auto): {contraida:.1f} px²{man_c}")
-    print(f"Área dilatada  (auto): {dilatada:.1f} px²{man_d}")
-    print(f"Amplitud de respuesta: {p['amplitud']:.1f} px²{man_a}")
-    print(f"Latencia: {p['latencia']:.2f} s   (estímulo -> inicio de {nombre_resp.lower()})")
-    print(f"Tiempo hasta el 95 % de la {nombre_resp.lower()}: {p['t_ext'] - t_est:.2f} s")
-    print(f"Velocidad media de {nombre_resp.lower()} (10-90 %): {p['vel_media']:.1f} px²/s")
-    print(f"Velocidad pico de {nombre_resp.lower()}: {p['vel_pico']:.1f} px²/s")
-    if hay_manual:
+    if p is not None:
+        print(f"Área contraída (auto): {contraida:.1f} px²{man_c}")
+        print(f"Área dilatada  (auto): {dilatada:.1f} px²{man_d}")
+        print(f"Amplitud de respuesta: {p['amplitud']:.1f} px²{man_a}")
+        print(f"Latencia: {p['latencia']:.2f} s   (estímulo -> inicio de {nombre_resp.lower()})")
+        print(f"Tiempo hasta el 95 % de la {nombre_resp.lower()}: {p['t_ext'] - t_est:.2f} s")
+        print(f"Velocidad media de {nombre_resp.lower()} (10-90 %): {p['vel_media']:.1f} px²/s")
+        print(f"Velocidad pico de {nombre_resp.lower()}: {p['vel_pico']:.1f} px²/s")
+    if hay_manual and p is not None:
         print(f"\n--- Validación vs. medición manual ---")
         if niveles_de_anotaciones:
             print("(niveles manuales tomados de tus anotaciones: promedio de las previas al estímulo y de las posteriores a la respuesta)")
@@ -1070,7 +1631,11 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
         print(f"Frames comparados: {len(tabla)} | MAE = {mae_fr:.1f} px² | RMSE = {rmse_fr:.1f} px²")
     elif anotaciones_manuales:
         print("\nNo se pudo comparar ninguna anotación: ningún frame coincide con la ventana analizada.")
- 
+
+    if p is None:
+        _mostrar_figuras()
+        return None
+
     d_cont, d_dil = 2 * np.sqrt(contraida / np.pi), 2 * np.sqrt(dilatada / np.pi)
     resultado = {
         'etiqueta': etiqueta, 'tipo': tipo, 'fps': fps, 't_estimulo': float(t_est),
@@ -1084,7 +1649,7 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
         'mae_frames': mae_fr, 'rmse_frames': rmse_fr,
         'tiempos': t, 'area_cruda': a_cruda, 'area_suave': a_suave,
     }
- 
+
     # ---------------- Salida estandarizada (CSV) ----------------
     if carpeta_salida:
         import csv
@@ -1105,7 +1670,8 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
             wr.writerow(campos)
             wr.writerow([f"{resultado[c]:.4f}" if isinstance(resultado[c], float) else resultado[c] for c in campos])
         print(f"\nCSV guardados en '{carpeta_salida}': {os.path.basename(base)}_curva.csv y _parametros.csv")
- 
+
+    _mostrar_figuras()
     return resultado
 
 # -----------------------------------------------------------------------
@@ -1593,37 +2159,105 @@ def exportar_frames_para_medir(video_path,
 # INSERCIÓN EN EL MAIN
 # ======================================================
 
+def procesar_registros(registros, carpeta_salida='resultados', area_min_px=250, area_max_px=2000):
+    """
+    registros: lista de dicts {'video': ruta, 'etiqueta': 'A1', 't_inicio': 0, 't_fin': None, 't_estimulo': None}
+    Procesa cada uno sin abrir ventanas, guarda sus CSV y escribe 'resumen_registros.csv'.
+    """
+    filas = []
+    for reg in registros:
+        r = procesar_modulo_3_2(reg['video'], t_inicio=reg.get('t_inicio', 0.0), t_fin=reg.get('t_fin'),
+                                t_estimulo_manual=reg.get('t_estimulo'), area_min_px=area_min_px,
+                                area_max_px=area_max_px, etiqueta=reg['etiqueta'],
+                                mostrar=False, carpeta_salida=carpeta_salida)
+        if r is not None:
+            filas.append(r)
+    if not filas:
+        print("Ningún registro pudo procesarse.")
+        return None
+
+    os.makedirs(carpeta_salida, exist_ok=True)
+    campos = ["etiqueta", "tipo", "t_estimulo", "area_contraida", "area_dilatada", "amplitud", "latencia",
+              "t_hasta_extremo", "vel_media", "vel_pico", "frames_artefacto", "frames_total"]
+    with open(os.path.join(carpeta_salida, 'resumen_registros.csv'), 'w', newline='', encoding='utf-8') as f:
+        wr = csv.writer(f)
+        wr.writerow(campos)
+        for r in filas:
+            wr.writerow([f"{r[c]:.4f}" if isinstance(r[c], float) else r[c] for c in campos])
+
+    print("\n" + "=" * 70)
+    print("RESUMEN DE REGISTROS")
+    print("=" * 70)
+    print(f"{'Registro':<10}{'Tipo':<18}{'Latencia (s)':>13}{'Amplitud (px²)':>16}{'Vel. media (px²/s)':>20}{'Vel. pico (px²/s)':>19}")
+    for r in filas:
+        print(f"{r['etiqueta']:<10}{r['tipo']:<18}{r['latencia']:>13.3f}{r['amplitud']:>16.1f}{r['vel_media']:>20.1f}{r['vel_pico']:>19.1f}")
+    for tipo in sorted({r['tipo'] for r in filas}):
+        g = [r for r in filas if r['tipo'] == tipo]
+        if len(g) < 2:
+            print(f"\n{tipo}: un solo registro, no se puede calcular variabilidad (hacen falta 2 o más).")
+            continue
+        print(f"\n{tipo} (n = {len(g)}), media ± desvío estándar muestral:")
+        for clave, nombre, u in (('latencia', 'Latencia', 's'), ('amplitud', 'Amplitud', 'px²'),
+                                 ('vel_media', 'Velocidad media', 'px²/s'), ('vel_pico', 'Velocidad pico', 'px²/s')):
+            v = np.array([r[clave] for r in g], float)
+            cv_ = 100 * v.std(ddof=1) / abs(v.mean()) if v.mean() else np.nan
+            print(f"   {nombre:<16}: {v.mean():9.3f} ± {v.std(ddof=1):7.3f} {u}   (coef. de variación {cv_:.1f} %)")
+    return filas
+
+
 def main():
+    # ======================= CONFIGURACIÓN (lo único que se edita) =======================
     video_original = 'registro_pupila.mp4'
     video_trabajo = 'registro_pupila_copia_2.mp4'
+    t_inicio, t_fin = 0.0, 7.5                   # ventana del 3.2 en segundos (t_fin = None -> hasta el final)
+    area_min, area_max = 250, 2000               # rango plausible del área de la pupila (px²) en tu video
+    anotaciones = {132: 624.0, 222: 1204.0}      # {nro_de_frame: área manual en px²}
+    ref_pupila = 'referencia_pupila.png'         # contorno manual de la pupila (lo usa el 2.3)
+    anotar_referencia = False                    # True = abrir la herramienta para dibujarlo (una sola vez)
+    exportar_roi_para_imagej = False             # True = guarda 'roi_para_anotar.png' para medir en ImageJ (una sola vez)
+    carpeta_salida = 'resultados'                # acá se guardan los CSV y figuras del 3.2
+    registros = []                               # opcional (variabilidad): [{'video': 'A1.mp4', 'etiqueta': 'A1'}, ...]
+    # =====================================================================================
 
     if not os.path.exists(video_trabajo):
         shutil.copy(video_original, video_trabajo)
 
     frame_representativo = obtener_mejor_frame(video_trabajo)
+    if frame_representativo is None:
+        print("No se pudo obtener un frame representativo del video.")
+        return
+    x, y, w, h = obtener_roi_automatica(frame_representativo)
+    roi = frame_representativo[y:y + h, x:x + w]
+    if exportar_roi_para_imagej:
+        guardar_roi_para_anotar(roi)
 
-    # ----- MÓDULOS 1, 2 y 3.1 (sobre el frame representativo) -----
-    if frame_representativo is not None:
-        x, y, w, h = obtener_roi_automatica(frame_representativo)
+    # ----- MÓDULO 1 (sobre el frame representativo) -----
+    procesar_modulo_1_1(frame_representativo, x, y, w, h)
+    procesar_modulo_1_2(frame_representativo, x, y, w, h)
+    procesar_modulo_1_2_4(roi, area_min, area_max)
+    procesar_modulo_1_3(frame_representativo, x, y, w, h, area_min_px=area_min, area_max_px=area_max)
 
-        procesar_modulo_1_1(frame_representativo, x, y, w, h)
-        procesar_modulo_1_2(frame_representativo, x, y, w, h)
-        procesar_modulo_1_3(frame_representativo, x, y, w, h)
+    # ----- MÓDULO 2 (sobre la ROI) -----
+    mascara_limpia, mascaras_m2 = procesar_modulo_2(roi)
+    if anotar_referencia:
+        anotar_contorno_manual(roi, ref_pupila)
+    procesar_modulo_2_3(roi, mascaras_m2, ref_pupila, area_min, area_max)   # si no hay referencia, avisa y sigue
 
-        roi = frame_representativo[y:y+h, x:x+w]
-        mascara_limpia = procesar_modulo_2(roi)
-        procesar_modulo_3_1(roi, mascara_limpia)
+    # ----- MÓDULO 3.1 (forma y textura, sobre la ROI) -----
+    procesar_modulo_3_1(roi, mascara_limpia)
 
-    # ----- MÓDULO 3.2 (consume todo el video) -----
-    exportar_frames_para_medir(video_trabajo)
-    anotaciones = {132: 624.0, 222: 1204.0}   # {nro_de_frame: área manual en px²}
-    procesar_modulo_3_2(video_trabajo, anotaciones_manuales=anotaciones,
-                    area_min_px=250, area_max_px=2000)
+    # ----- MÓDULO 3.2 (procesa todo el video) -----
+    # exportar_frames_para_medir(video_trabajo)   # descomentar solo para exportar los frames a medir en ImageJ
+    procesar_modulo_3_2(video_trabajo, t_inicio=t_inicio, t_fin=t_fin,
+                        anotaciones_manuales=anotaciones or None,
+                        area_min_px=area_min, area_max_px=area_max,
+                        roi_manual=(x, y, w, h),
+                        carpeta_salida=carpeta_salida)
+    if registros:
+        procesar_registros(registros, carpeta_salida, area_min, area_max)
 
-    # ----- MÓDULO 4 (sobre el frame representativo) -----
-    if frame_representativo is not None:
-        procesar_modulo_4(frame_representativo, x, y, w, h,
-                          area_min_px=250, area_max_px=2000)
+    # ----- MÓDULO 4 (compresión, sobre el frame representativo) -----
+    procesar_modulo_4(frame_representativo, x, y, w, h, area_min_px=area_min, area_max_px=area_max)
 
 
 if __name__ == '__main__':
