@@ -1,0 +1,27 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+ 
+# ---------- Editores / sistema ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+ 
+# ---------- Videos ----------
+# Son pesados (GitHub rechaza archivos de más de 100 MB) y muestran el ojo de una persona.
+# Si igual querés subir alguno, borrá esta línea o agregá una excepción, por ejemplo: !registro_pupila.mp4
+*.mp4
+*.avi
+*.mov
+ 
+# ---------- Archivos que genera el programa (se regeneran al correrlo) ----------
+Respuestas*.pdf
+resultados/
+frames_manual*/
+figuras_*/
+roi_para_anotar*.png

@@ -30,7 +30,307 @@ from matplotlib.patches import Ellipse, Rectangle
 import heapq
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
-# ======================================================
+
+# GENERACION DEL PDF
+import sys
+import contextlib
+import re
+import tempfile
+from fpdf import FPDF
+from datetime import datetime
+
+class CapturadorPDF:
+    """
+    Captura lo que se imprime en la terminal Y las figuras que se muestran (plt.show y cv2.imshow),
+    en el mismo orden en que aparecen, para después armar un PDF con texto e imágenes intercalados.
+    Las imágenes se guardan en una carpeta temporal que se borra una vez armado el PDF.
+    """
+    def __init__(self, dpi=120, mostrar_ventanas=False):
+        self.consola_original = sys.stdout
+        self.mostrar_ventanas = mostrar_ventanas    # False = las figuras solo se guardan, no se abren
+        self.contenido = []                 # elementos: ('texto', str) o ('imagen', ruta, titulo)
+        self.carpeta_imagenes = None                # se crea en activar() (carpeta temporal del sistema)
+        self.dpi = dpi
+        self._n_img = 0
+        self._cv2_pendientes = {}           # ventana de cv2 -> última imagen mostrada (se guarda en waitKey(0))
+        self._originales = None
+
+    # ------------------------- texto -------------------------
+    def write(self, mensaje):
+        # Muestra el texto en la terminal normal
+        self.consola_original.write(mensaje)
+        # Y también lo guarda en nuestra lista
+        self.contenido.append(('texto', mensaje))
+
+    def flush(self):
+        self.consola_original.flush()
+
+    # ------------------------ imágenes ------------------------
+    def _ruta_nueva(self):
+        self._n_img += 1
+        return os.path.join(self.carpeta_imagenes, f"figura_{self._n_img:03d}.png")
+
+    def _guardar_figuras_plt(self):
+        """Guarda todas las figuras de matplotlib abiertas que todavía no estén en el PDF."""
+        for num in plt.get_fignums():
+            fig = plt.figure(num)
+            if getattr(fig, '_ya_en_pdf', False):
+                continue
+            ruta = self._ruta_nueva()
+            fig.savefig(ruta, dpi=self.dpi, bbox_inches='tight')
+            fig._ya_en_pdf = True
+            self.contenido.append(('imagen', ruta, ''))
+
+    def _show(self, *args, **kwargs):
+        self._guardar_figuras_plt()
+        if self.mostrar_ventanas:
+            return self._originales['show'](*args, **kwargs)
+        plt.close('all')                    # no se abren: se cierran para liberar memoria
+
+    def _imshow(self, nombre, imagen):
+        self._cv2_pendientes[nombre] = np.array(imagen, copy=True)
+        if self.mostrar_ventanas:
+            return self._originales['imshow'](nombre, imagen)
+
+    def _waitkey(self, delay=0):
+        # Solo se guardan las ventanas que esperan una tecla (waitKey(0)); así no se guardan los
+        # cientos de cuadros de las ventanas interactivas (p. ej. la herramienta de anotación).
+        if delay <= 0:
+            for nombre, img in self._cv2_pendientes.items():
+                if img.dtype != np.uint8:
+                    img = cv2.normalize(img.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                ruta = self._ruta_nueva()
+                cv2.imwrite(ruta, img)
+                self.contenido.append(('imagen', ruta, nombre))
+            self._cv2_pendientes.clear()
+        if self.mostrar_ventanas:
+            return self._originales['waitKey'](delay)
+        return -1                           # como si no se hubiera apretado ninguna tecla
+
+    def _destroy_all(self):
+        self._cv2_pendientes.clear()
+        if self.mostrar_ventanas:
+            return self._originales['destroyAllWindows']()
+
+    @contextlib.contextmanager
+    def ventanas_reales(self):
+        """Dentro de este bloque las ventanas sí se abren (para herramientas interactivas, como anotar la pupila)."""
+        previo = self.mostrar_ventanas
+        self.mostrar_ventanas = True
+        try:
+            yield
+        finally:
+            self.mostrar_ventanas = previo
+
+    # ------------------- activar / desactivar -------------------
+    def activar(self):
+        self.carpeta_imagenes = tempfile.mkdtemp(prefix="figuras_pdf_")
+        self._originales = {'show': plt.show, 'imshow': cv2.imshow,
+                            'waitKey': cv2.waitKey, 'destroyAllWindows': cv2.destroyAllWindows}
+        # Se usan funciones comunes (no métodos) porque matplotlib, al cargar su backend, les agrega atributos
+        def show(*args, **kwargs): return self._show(*args, **kwargs)
+        def imshow(nombre, imagen): return self._imshow(nombre, imagen)
+        def waitKey(delay=0): return self._waitkey(delay)
+        def destroyAllWindows(): return self._destroy_all()
+        plt.show = show
+        cv2.imshow = imshow
+        cv2.waitKey = waitKey
+        cv2.destroyAllWindows = destroyAllWindows
+        sys.stdout = self
+
+    def desactivar(self):
+        sys.stdout = self.consola_original
+        if self._originales:
+            plt.show = self._originales['show']
+            cv2.imshow = self._originales['imshow']
+            cv2.waitKey = self._originales['waitKey']
+            cv2.destroyAllWindows = self._originales['destroyAllWindows']
+            self._originales = None
+
+    @staticmethod
+    def _separar_titulos(texto):
+        """
+        Divide el texto impreso en bloques ('titulo' | 'subtitulo' | 'cuerpo') según cómo se imprimió:
+          TÍTULO    : una línea encerrada entre dos líneas de '====='
+          SUBTÍTULO : '--- texto ---', '[1] texto', '1.3.2 texto' o '>>> texto' al principio de la línea
+        """
+        es_regla = lambda l: len(l.strip()) >= 10 and set(l.strip()) == {'='}
+        sacar_guiones = lambda l: re.sub(r'\s*-{3,}.*$', '', re.sub(r'^\s*-{3,}\s*', '', l)).strip()
+        patrones_sub = [r'^-{3,}\s*(.+?)\s*-{3,}', r'^(\[\d+\]\s+\S.*)', r'^(\d+\.\d+(?:\.\d+)*\s+\S.*)', r'^>>>\s*(.+)']
+
+        lineas = texto.split('\n')
+        bloques, cuerpo = [], []
+
+        def cerrar_cuerpo():
+            if cuerpo:
+                bloques.append(('cuerpo', '\n'.join(cuerpo)))
+                cuerpo.clear()
+
+        i = 0
+        while i < len(lineas):
+            l = lineas[i]
+            if es_regla(l):
+                if i + 2 < len(lineas) and lineas[i + 1].strip() and es_regla(lineas[i + 2]):
+                    cerrar_cuerpo()
+                    bloques.append(('titulo', sacar_guiones(lineas[i + 1])))
+                    i += 3
+                else:
+                    i += 1                                   # línea de '=' suelta: no se escribe
+                continue
+            sub = next((m.group(1) for p in patrones_sub if (m := re.match(p, l.rstrip()))), None)
+            if sub:
+                cerrar_cuerpo()
+                bloques.append(('subtitulo', sub.strip()))
+            else:
+                cuerpo.append(l)
+            i += 1
+        cerrar_cuerpo()
+        return bloques
+
+    def borrar_imagenes(self):
+        """Borra la carpeta temporal con las figuras (llamar después de generar_pdf)."""
+        if self.carpeta_imagenes and os.path.isdir(self.carpeta_imagenes):
+            shutil.rmtree(self.carpeta_imagenes, ignore_errors=True)
+        self.carpeta_imagenes = None
+
+    # -------------------------- PDF --------------------------
+    @staticmethod
+    def _limpiar(texto):
+        # FPDF clásico no soporta bien algunos símbolos como '²' o '±'.
+        # Los reemplazamos por equivalentes para evitar errores de codificación.
+        texto = texto.replace('²', '^2').replace('±', '+/-').replace('á', 'a').replace('é', 'e').replace('í', 'i').replace('ó', 'o').replace('ú', 'u').replace('Á', 'A').replace('É', 'E').replace('Í', 'I').replace('Ó', 'O').replace('Ú', 'U').replace('ñ', 'n').replace('Ñ', 'N')
+        return texto.encode('latin-1', 'ignore').decode('latin-1')
+
+    def generar_pdf(self, nombre_archivo="Respuestas.pdf", video=None, titulo="Respuestas"):
+        nombre_video = os.path.basename(video) if video else ""
+        fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+        class PDFConEncabezado(FPDF):
+            """FPDF llama solo a header() y footer() en cada página nueva. En la portada (página 1) no se dibujan."""
+            def header(self):
+                if self.page_no() == 1:
+                    return
+                self.set_font("Helvetica", "I", 8)
+                self.set_text_color(110)
+                self.set_xy(self.l_margin, 10)
+                self.cell(0, 5, CapturadorPDF._limpiar(f"{titulo} - {nombre_video}" if nombre_video else titulo), align="L")
+                self.set_xy(self.l_margin, 10)
+                self.cell(0, 5, fecha, align="R")
+                self.set_draw_color(170)
+                self.line(self.l_margin, 16, self.w - self.r_margin, 16)
+                self.set_text_color(0)
+                self.set_y(20)
+
+            def footer(self):
+                if self.page_no() == 1:
+                    return
+                self.set_y(-15)
+                self.set_font("Helvetica", "I", 8)
+                self.set_text_color(110)
+                self.cell(0, 10, f"Página {self.page_no()} de {{nb}}", align="C")   # {nb} = total de páginas
+                self.set_text_color(0)
+
+        COLOR_TITULO = (25, 60, 120)       # azul oscuro
+        COLOR_SUBTITULO = (60, 60, 60)     # gris oscuro
+        pdf = PDFConEncabezado()
+        ancho_util = pdf.w - pdf.l_margin - pdf.r_margin
+        alto_util = pdf.h - 20 - pdf.b_margin              # 20 mm arriba por el encabezado
+
+        # ---------------- Portada ----------------
+        pdf.add_page()
+        pdf.set_y(95)
+        pdf.set_font("Helvetica", "B", 28)
+        pdf.cell(0, 14, self._limpiar(titulo), align="C")
+        pdf.ln(20)
+        pdf.set_draw_color(120)
+        pdf.line(pdf.w / 2 - 40, pdf.get_y(), pdf.w / 2 + 40, pdf.get_y())
+        pdf.ln(10)
+        if nombre_video:
+            pdf.set_font("Helvetica", "", 14)
+            pdf.cell(0, 8, self._limpiar(f"Video analizado: {nombre_video}"), align="C")
+            pdf.ln(10)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.set_text_color(90)
+        pdf.cell(0, 6, f"Generado el {fecha}", align="C")
+        pdf.set_text_color(0)
+
+        # ---------------- Contenido ----------------
+        pdf.add_page()
+
+        # Junta los textos consecutivos en un solo bloque
+        bloques = []
+        for item in self.contenido:
+            if item[0] == 'texto' and bloques and bloques[-1][0] == 'texto':
+                bloques[-1] = ('texto', bloques[-1][1] + item[1])
+            else:
+                bloques.append(item)
+
+        for b in bloques:
+            if b[0] == 'texto':
+                for tipo, contenido in self._separar_titulos(self._limpiar(b[1])):
+                    pdf.set_x(pdf.l_margin)
+                    if tipo == 'titulo':
+                        if pdf.get_y() > pdf.h - pdf.b_margin - 35:       # que no quede un título solo al pie de la página
+                            pdf.add_page()
+                        pdf.ln(4)
+                        pdf.set_font("Helvetica", "B", 15)
+                        pdf.set_text_color(*COLOR_TITULO)
+                        pdf.multi_cell(0, 8, txt=contenido)
+                        pdf.set_draw_color(*COLOR_TITULO)
+                        pdf.set_line_width(0.5)
+                        pdf.line(pdf.l_margin, pdf.get_y() + 1, pdf.w - pdf.r_margin, pdf.get_y() + 1)
+                        pdf.set_line_width(0.2)
+                        pdf.ln(5)
+                    elif tipo == 'subtitulo':
+                        if pdf.get_y() > pdf.h - pdf.b_margin - 25:
+                            pdf.add_page()
+                        pdf.ln(2)
+                        pdf.set_font("Helvetica", "B", 11)
+                        pdf.set_text_color(*COLOR_SUBTITULO)
+                        pdf.multi_cell(0, 6, txt=contenido)
+                        pdf.ln(1)
+                    else:
+                        texto = contenido.strip('\n')
+                        if not texto.strip():
+                            continue
+                        # Courier es clave para que las tablas del código no se deformen
+                        pdf.set_font("Courier", size=9)
+                        pdf.multi_cell(0, 4, txt=texto)
+                        pdf.ln(2)
+                    pdf.set_text_color(0)
+            else:
+                _, ruta, titulo_img = b
+                img = cv2.imread(ruta)
+                if img is None:
+                    continue
+                alto_px, ancho_px = img.shape[:2]
+                w = ancho_util
+                h = w * alto_px / ancho_px
+                if h > 0.9 * alto_util:                 # figuras muy altas: se achican para que entren en una página
+                    h = 0.9 * alto_util
+                    w = h * ancho_px / alto_px
+                alto_titulo = 5 if titulo_img else 0
+                if pdf.get_y() + alto_titulo + h > pdf.h - pdf.b_margin:
+                    pdf.add_page()
+                if titulo_img:
+                    pdf.set_font("Courier", "B", 9)
+                    pdf.set_x(pdf.l_margin)
+                    pdf.cell(0, 5, txt=self._limpiar(titulo_img))
+                    pdf.ln(5)
+                y = pdf.get_y()
+                pdf.image(ruta, x=pdf.l_margin + (ancho_util - w) / 2, y=y, w=w, h=h)
+                pdf.set_y(y + h + 4)
+
+        pdf.output(nombre_archivo)
+
+
+
+
+
+
+
+
+
 
 # ======================================================================
 # UTILIDADES COMUNES
@@ -125,6 +425,9 @@ def obtener_roi_automatica(frame):
 
 
 def procesar_modulo_1_1(frame, x, y, w, h):
+    print("\n" + "=" * 70)
+    print("--- 1.1 Resolución, cuantización y espacios de color ---")
+    print("=" * 70)
     roi = frame[y:y+h, x:x+w]
 
     # Mostramos el recorte en pantalla para verificar el encuadre
@@ -220,6 +523,9 @@ def escalar_rango(gris, f1, f2):
     return (np.clip((gris.astype(np.float32) - f1) / max(f2 - f1, 1e-6), 0, 1) * 255).astype(np.uint8)
     
 def procesar_modulo_1_2(frame, x, y, w, h):
+    print("\n" + "=" * 70)
+    print("--- 1.2 Contraste e histograma ---")
+    print("=" * 70)
     roi = frame[y:y+h, x:x+w]
     
     roi_gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -675,10 +981,10 @@ def anotar_contorno_manual(roi, ruta_salida='referencia_pupila.png', forma='elip
     return m
  
  
-def guardar_roi_para_anotar(roi, ruta='roi_para_anotar.png'):
-    """Si preferís anotar en ImageJ: guarda la ROI exacta; dibujá la pupila, Edit > Selection > Create Mask y guardá como referencia_pupila.png."""
+def guardar_roi_para_anotar(roi, ruta='roi_para_anotar.png', ruta_ref='referencia_pupila.png'):
+    """Si preferís anotar en ImageJ: guarda la ROI exacta; dibujá la pupila, Edit > Selection > Create Mask y guardá como ruta_ref."""
     cv2.imwrite(ruta, roi)
-    print(f"ROI guardada en '{ruta}'. Anotala y guardá la máscara como 'referencia_pupila.png' (blanco = pupila, mismo tamaño).")
+    print(f"ROI guardada en '{ruta}'. Anotala y guardá la máscara como '{ruta_ref}' (blanco = pupila, mismo tamaño).")
  
  
 def _mayor_componente(mascara):
@@ -767,6 +1073,9 @@ def procesar_modulo_2_3(roi, mascaras, ruta_ref='referencia_pupila.png', area_mi
     return filas
 
 def procesar_modulo_2(roi):
+    print("\n" + "=" * 70)
+    print("--- 2.1 y 2.2 Segmentación de la pupila y morfología ---")
+    print("=" * 70)
     # Extraemos los canales y nos quedamos solo con el Rojo (R)
     b, g, r = cv2.split(roi)
     
@@ -912,6 +1221,9 @@ def _glcm_region(canal, region, niveles=32):
 def procesar_modulo_3_1(roi, mascara_limpia, factor_iris=2.6, usar_elipse=False):
     """usar_elipse=True: en vez de la máscara del Módulo 2 usa la pupila por gradiente/elipse del Módulo 3.2
     (conviene si el Dice del 2.3 muestra que es mejor, y es más robusto con videos nuevos)."""
+    print("\n" + "=" * 70)
+    print("--- 3.1 Forma y textura ---")
+    print("=" * 70)
     if usar_elipse:
         m_el, _ = _mascara_pupila_elipse(roi)
         if m_el is not None:
@@ -1383,7 +1695,9 @@ def procesar_modulo_3_2(video_path, t_inicio=0.0, t_fin=7.5, t_estimulo_manual=N
     """
     if t_fin is None:
         t_fin = float('inf')
-    print(f"\n--- 3.2 Procesando video ({etiqueta}) --- [versión 3.2 final v4]")
+    print("\n" + "=" * 70)
+    print(f"--- 3.2 Dinámica pupilar ({etiqueta}) ---")
+    print("=" * 70)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -2208,16 +2522,38 @@ def procesar_registros(registros, carpeta_salida='resultados', area_min_px=250, 
 def main():
     # ======================= CONFIGURACIÓN (lo único que se edita) =======================
     video_original = 'registro_pupila.mp4'
-    video_trabajo = 'registro_pupila_copia_2.mp4'
     t_inicio, t_fin = 0.0, 7.5                   # ventana del 3.2 en segundos (t_fin = None -> hasta el final)
     area_min, area_max = 250, 2000               # rango plausible del área de la pupila (px²) en tu video
-    anotaciones = {132: 624.0, 222: 1204.0}      # {nro_de_frame: área manual en px²}
-    ref_pupila = 'referencia_pupila.png'         # contorno manual de la pupila (lo usa el 2.3)
-    anotar_referencia = False                    # True = abrir la herramienta para dibujarlo (una sola vez)
-    exportar_roi_para_imagej = False             # True = guarda 'roi_para_anotar.png' para medir en ImageJ (una sola vez)
-    carpeta_salida = 'resultados'                # acá se guardan los CSV y figuras del 3.2
+    # Mediciones manuales de cada video: {nombre del video sin extensión: {nro_de_frame: área manual en px²}}
+    anotaciones_por_video = {
+        'registro_pupila': {132: 624.0, 222: 1204.0},
+        # 'otro_video': {150: 700.0, 240: 1100.0},
+    }
+    anotar_referencia = False                    # True = abrir la herramienta para dibujar la pupila (una vez por video)
+    exportar_roi_para_imagej = False             # True = guarda la ROI para medir en ImageJ (una vez por video)
+    carpeta_salida = 'resultados'                # acá se guardan los CSV y figuras del 3.2 (con el nombre del video)
     registros = []                               # opcional (variabilidad): [{'video': 'A1.mp4', 'etiqueta': 'A1'}, ...]
     # =====================================================================================
+
+    # Todos los archivos que genera el programa llevan el nombre del video, así no se pisan entre videos
+    nombre_video, extension = os.path.splitext(os.path.basename(video_original))
+    video_trabajo = f"{nombre_video}_copia{extension}"
+    ref_pupila = f"referencia_{nombre_video}.png"            # contorno manual de la pupila (lo usa el 2.3)
+    roi_imagej = f"roi_para_anotar_{nombre_video}.png"
+    nombre_pdf = f"Respuestas_{nombre_video}.pdf"
+    anotaciones = anotaciones_por_video.get(nombre_video)
+
+    if not os.path.exists(video_original):
+        print(f"No se encontró el video '{video_original}'.")
+        return
+
+    capturador = CapturadorPDF()
+    capturador.activar()      # captura texto Y figuras desde acá
+
+    print(f"VIDEO ANALIZADO: {video_original}")
+    if not anotaciones:
+        print(f"(No hay anotaciones manuales para '{nombre_video}' en anotaciones_por_video: "
+              f"el 3.2 se hace sin validación manual.)")
 
     if not os.path.exists(video_trabajo):
         shutil.copy(video_original, video_trabajo)
@@ -2225,11 +2561,13 @@ def main():
     frame_representativo = obtener_mejor_frame(video_trabajo)
     if frame_representativo is None:
         print("No se pudo obtener un frame representativo del video.")
+        capturador.desactivar()
+        capturador.borrar_imagenes()
         return
     x, y, w, h = obtener_roi_automatica(frame_representativo)
     roi = frame_representativo[y:y + h, x:x + w]
     if exportar_roi_para_imagej:
-        guardar_roi_para_anotar(roi)
+        guardar_roi_para_anotar(roi, roi_imagej, ref_pupila)
 
     # ----- MÓDULO 1 (sobre el frame representativo) -----
     procesar_modulo_1_1(frame_representativo, x, y, w, h)
@@ -2240,24 +2578,33 @@ def main():
     # ----- MÓDULO 2 (sobre la ROI) -----
     mascara_limpia, mascaras_m2 = procesar_modulo_2(roi)
     if anotar_referencia:
-        anotar_contorno_manual(roi, ref_pupila)
+        with capturador.ventanas_reales():   # esta herramienta necesita la ventana para poder hacer clic
+            anotar_contorno_manual(roi, ref_pupila)
     procesar_modulo_2_3(roi, mascaras_m2, ref_pupila, area_min, area_max)   # si no hay referencia, avisa y sigue
 
     # ----- MÓDULO 3.1 (forma y textura, sobre la ROI) -----
     procesar_modulo_3_1(roi, mascara_limpia)
 
     # ----- MÓDULO 3.2 (procesa todo el video) -----
-    # exportar_frames_para_medir(video_trabajo)   # descomentar solo para exportar los frames a medir en ImageJ
+    # exportar_frames_para_medir(video_trabajo, carpeta=f'frames_manual_{nombre_video}')   # descomentar solo para exportar los frames a medir en ImageJ
     procesar_modulo_3_2(video_trabajo, t_inicio=t_inicio, t_fin=t_fin,
                         anotaciones_manuales=anotaciones or None,
                         area_min_px=area_min, area_max_px=area_max,
                         roi_manual=(x, y, w, h),
+                        etiqueta=nombre_video,
                         carpeta_salida=carpeta_salida)
     if registros:
         procesar_registros(registros, carpeta_salida, area_min, area_max)
 
     # ----- MÓDULO 4 (compresión, sobre el frame representativo) -----
     procesar_modulo_4(frame_representativo, x, y, w, h, area_min_px=area_min, area_max_px=area_max)
+
+    # --- FINALIZAR Y CREAR PDF ---
+    capturador.desactivar()   # Devolvemos la consola, plt.show y cv2 a la normalidad
+    capturador.generar_pdf(nombre_pdf, video=video_original)
+    capturador.borrar_imagenes()   # las figuras ya están dentro del PDF
+    print(f"\n¡Archivo '{nombre_pdf}' generado con éxito con todos los resultados!")
+
 
 
 if __name__ == '__main__':
