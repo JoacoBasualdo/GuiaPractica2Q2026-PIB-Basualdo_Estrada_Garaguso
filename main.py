@@ -38,6 +38,35 @@ import re
 import tempfile
 from fpdf import FPDF
 from datetime import datetime
+import tkinter as tk
+from tkinter import messagebox
+
+def mostrar_instrucciones_interactivas():
+    """
+    Muestra una ventana emergente al iniciar el programa con una guía clara
+    sobre cómo configurar el video y las opciones de anotación en el código.
+    """
+    root = tk.Tk()
+    root.withdraw() # Oculta la ventana principal de Tkinter para que solo salga el cartel
+    
+    titulo = "Guía de Configuración - Procesamiento de Pupila"
+    mensaje = (
+        "Los siguientes cambios se tienen que hacer en 'main()' al operar con un nuevo video:\n\n"
+        "📌 1. CAMBIAR EL VIDEO A ANALIZAR:\n"
+        "   - Buscá en 'main()' la línea: video_original = 'registro_pupila.mp4'\n"
+        "   - Reemplazá 'registro_pupila.mp4' por el nombre del nuevo archivo de video (ej. 'video_prueba2.mp4').\n\n"
+        "📌 2. CONFIGURAR ANOTACIONES MANUALES (True / False):\n"
+        "   - anotar_referencia = True / False\n"
+        "     (Ponelo en True la PRIMERA VEZ que analices un video nuevo para dibujar la máscara del Módulo 2.3).\n"
+        "   - anotar_frames_3_2 = True / False\n"
+        "     (Ponelo en True la PRIMERA VEZ que se trabaja con el nuevo video para medir con clics los frames del Módulo 3.2).\n\n"
+        "ℹ️ Una vez creados los archivos .png y .csv de un video, volvé a poner ambas opciones en FALSE "
+        "para que el programa corra 100% automatizado (ideal para la evaluación de la cátedra).\n"
+        "El pdf generado cuenta con respuestas variables según video, y con respuestas que solo aplican al video original del grupo"
+    )
+    
+    messagebox.showinfo(titulo, mensaje)
+    root.destroy()
 
 class CapturadorPDF:
     """
@@ -2683,6 +2712,8 @@ def obtener_o_anotar_manual_3_2(video_path, x, y, w, h, ruta_csv,
 
 
 def main():
+    # ======================= VENTANA DE INSTRUCCIONES =======================
+    mostrar_instrucciones_interactivas()
     # ======================= CONFIGURACIÓN (lo único que se edita) =======================
     video_original = 'registro_pupila.mp4'
     t_inicio, t_fin = 0.0, 7.5                   # ventana del 3.2 en segundos (t_fin = None -> hasta el final)
