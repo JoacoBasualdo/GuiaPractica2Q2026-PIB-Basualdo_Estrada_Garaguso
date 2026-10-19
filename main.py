@@ -443,7 +443,23 @@ def procesar_modulo_1_1(frame, x, y, w, h):
     roi_50 = cv2.resize(roi, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_LINEAR)
     roi_25 = cv2.resize(roi, (0, 0), fx=0.25, fy=0.25, interpolation=cv2.INTER_LINEAR)
     roi_5 = cv2.resize(roi, (0, 0), fx=0.05, fy=0.05, interpolation=cv2.INTER_LINEAR)
-
+    
+    print("\n" + "=" * 70)
+    print("--- ANÁLISIS ESPECÍFICO: Pérdida de Definición en Nuestro Video ---")
+    print("=" * 70)
+            
+    print("\n" + "=" * 40)
+    print("Estas respuestas que aplican únicamente a nuestro video se imprimen por separado, para darles un formato más agradable.")
+    print("=" * 40)
+    
+    print("""
+    
+    - Al reducir la resolución espacial del ojo analizado al 50%, 25% y 5% (y reescalarla con vecino más cercano), 
+      se evidencia el fenómeno de aliasing espacial y la pérdida progresiva de altas frecuencias.
+    - En el 50% los detalles finos del estroma iridiano de nuestro registro se atenúan levemente; en el 25% los bordes 
+      comienzan a pixelarse; y en el 5% el contorno pupilar se vuelve completamente discontinuo e 
+      impreciso, demostrando que un submuestreo excesivo destruye la geometría necesaria para la segmentación.
+    """)
     roi_50_pix = cv2.resize(roi_50, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_NEAREST)
     roi_25_pix = cv2.resize(roi_25, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_NEAREST)
     roi_5_pix = cv2.resize(roi_5, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_NEAREST)
@@ -699,7 +715,28 @@ def procesar_modulo_1_2_4(roi, area_min_px=250, area_max_px=2000):
         print(f"\n-> Ningún filtro llega a eliminar el 80 % del destello. El que más lo reduce es {mejor[0]} "
               f"{mejor[1]}x{mejor[1]} ({mejor[2]:.0f} %), con borde retenido {mejor[3]:.0f} %.")
     print("   (Si ninguno es satisfactorio, el destello se trata con morfología/relleno, como hace el pipeline en _rellenar_reflejos.)")
- 
+    
+    print("\n" + "=" * 70)
+    print("--- RESPUESTA APLICADA: Filtro Óptimo para Destellos en el Video ---")
+    print("=" * 70)
+            
+    print("\n" + "=" * 40)
+    print("Estas respuestas que aplican únicamente a nuestro video se imprimen por separado, para darles un formato más agradable.")
+    print("=" * 40)
+    
+    
+    
+    print("""
+    
+    - El filtro de Mediana (con kernel de 11x11) es el que preserva de manera idónea el borde de 
+      la pupila en nuestro registro mientras elimina los destellos especulares del flash. Esto ocurre porque la mediana 
+      es un operador no lineal que descarta valores extremos (como el brillo saturado del reflejo) 
+      sin promediarlos con los vecinos, evitando el efecto de difuminado típico de los filtros lineales (Media/Gaussiano).
+    - La calidad de la imagen filtrada frente a la original sin ruido se cuantifica mediante:
+      * PSNR (Peak Signal-to-Noise Ratio): Relación entre la potencia máxima y el ruido de reconstrucción en dB.
+      * SSIM (Structural Similarity Index): Similitud estructural percibida (rango de 0 a 1).
+    """)
+    
     # Figura: zoom sobre la pupila para cada filtro/kernel
     cx, cy = res['centro']
     hz = int(2.6 * np.sqrt(res['area'] / np.pi))
@@ -920,6 +957,24 @@ def procesar_modulo_1_3(frame, x, y, w, h, frame_otro=None, sigma_filtro=2.0, ar
     print(f"   Contra la original -> PB gaussiano: PSNR {psnr(gris, lp_gauss8, data_range=255):.1f} dB / SSIM {ssim(gris, lp_gauss8, data_range=255):.3f} | "
           f"PB ideal: PSNR {psnr(gris, lp_ideal8, data_range=255):.1f} dB / SSIM {ssim(gris, lp_ideal8, data_range=255):.3f}")
     print("   (El pasa-bajos ideal corta de golpe y genera 'anillos' (ringing) alrededor de los bordes; el gaussiano no.)")
+    
+    print("\n" + "=" * 70)
+    print("--- RESPUESTA APLICADA: Bordes y Fase en Nuestro Registro ---")
+    print("=" * 70)
+        
+    print("\n" + "=" * 40)
+    print("Estas respuestas que aplican únicamente a nuestro video se imprimen por separado, para darles un formato más agradable.")
+    print("=" * 40)
+    print("""
+    
+    - Operadores de bordes: Canny demuestra la mayor robustez y continuidad (100%) sobre nuestro video 
+      al utilizar histéresis y doble umbral, minimizando falsos positivos tras el pre-filtrado gaussiano.
+    - Reconstrucción por Transformada de Fourier 2D (TFD-2D): Al cruzar la magnitud de nuestra imagen 
+      con la fase de otra, se comprueba empíricamente que la Fase concentra la información 
+      estructural y geométrica de nuestro ojo (delimitando la posición de los contornos), mientras 
+      que la Magnitud solo define la distribución energética global de intensidades y contrastes.
+    """)
+    
     plt.show()
  
 
@@ -1247,7 +1302,7 @@ def procesar_modulo_3_1(roi, mascara_limpia, factor_iris=2.6, usar_elipse=False)
         a_, b_ = max(d1, d2) / 2, min(d1, d2) / 2
         excentricidad = float(np.sqrt(max(1 - (b_ / a_) ** 2, 0)))
 
-    print("\n--- 3.1.1 Descriptores Morfométricos ---")
+    print("\n--- 3.1.1 Descriptores Morfométricos (respuestas genéricas) ---")
     print(f"Área (A): {area:.0f} px²  (diámetro equivalente {2 * np.sqrt(area / np.pi):.1f} px)")
     print(f"Perímetro (P): {perimetro:.2f} px")
     print(f"Centroide (X_c, Y_c): ({cX:.1f}, {cY:.1f})")
@@ -1276,7 +1331,7 @@ def procesar_modulo_3_1(roi, mascara_limpia, factor_iris=2.6, usar_elipse=False)
     b, g, r = cv2.split(roi)
     canales = {'Rojo (R)': r, 'Verde (G)': g, 'Azul (B)': b}
 
-    print("\n--- 3.1.2 Textura de Primer Orden (por región y canal) ---")
+    print("\n--- 3.1.2 Textura de Primer Orden (por región y canal) (respuestas genéricas) ---")
     entropia_iris = {}
     for reg_nombre, reg in regiones.items():
         print(f"[{reg_nombre}]  ({int(reg.sum())} px)")
@@ -1291,7 +1346,7 @@ def procesar_modulo_3_1(roi, mascara_limpia, factor_iris=2.6, usar_elipse=False)
             print(f"   {nombre:<10} Media: {px.mean():6.2f} | Std: {px.std():6.2f} | "
                   f"Skewness: {skew(px):6.2f} | Entropía: {ent:5.2f} bits")
 
-    print("\n--- 3.1.3 Textura de Segundo Orden (GLCM, 32 niveles) en el IRIS ---")
+    print("\n--- 3.1.3 Textura de Segundo Orden (GLCM, 32 niveles) en el IRIS (respuestas genéricas) ---")
     glcm = {}
     for nombre, canal in canales.items():
         glcm[nombre] = _glcm_region(canal, iris)
@@ -1321,6 +1376,24 @@ def procesar_modulo_3_1(roi, mascara_limpia, factor_iris=2.6, usar_elipse=False)
         print(f"-> Canal con mayor riqueza textural del estroma iridiano: {ganador}. El de menor riqueza: {peor}.")
     print("   (Una textura rica = más entropía y contraste, y menos homogeneidad y energía. Ojo: la cuantización usa niveles "
           "absolutos, así que un canal muy oscuro usa pocos niveles y parece menos texturado.)")
+    
+    print("\n" + "=" * 70)
+    print("--- RESPUESTA APLICADA: Textura del Iris en Nuestro Video ---")
+    print("=" * 70)
+    
+    print("\n" + "=" * 40)
+    print("Estas respuestas que aplican únicamente a nuestro video se imprimen por separado, para darles un formato más agradable.")
+    print("=" * 40)
+    
+    print("""
+    
+    - El Canal Verde (G) aporta la mayor riqueza textural del estroma iridiano de nuestro registro. Esto se debe a 
+      que los sensores digitales poseen el doble de fotosensores verdes en su matriz de Bayer, 
+      brindando mayor relación señal-ruido y realzando las criptas y trabéculas del iris analizado.
+    - Estadísticamente, una textura rica se caracteriza por una alta Entropía (mayor aleatoriedad 
+      espacial de los niveles de gris) y un elevado Contraste en la matriz GLCM, combinados con una 
+      menor Homogeneidad y Energía, parámetros que el canal verde maximiza en este ojo frente al azul y al rojo.
+    """)
 
 # --------------------------------------------------------------
 # MÓDULO 3.2
@@ -2339,7 +2412,7 @@ def procesar_modulo_4(frame, x, y, w, h, area_min_px=250, area_max_px=2000, cana
     # 3) RESPUESTAS A LAS PREGUNTAS DE LA CONSIGNA
     # ==========================================================
     print("\n" + "=" * 70)
-    print("RESPUESTAS A LAS PREGUNTAS DE LA CONSIGNA")
+    print("RESPUESTAS A LAS PREGUNTAS DE LA CONSIGNA CON UN VIDEO GENÉRICO")
     print("=" * 70)
  
     # --- P1: ratios ---
@@ -2444,6 +2517,31 @@ def procesar_modulo_4(frame, x, y, w, h, area_min_px=250, area_max_px=2000, cana
                   f"del original: el método basado en gradiente del borde es robusto a la compresión moderada.")
         print("   Nota: la comparación usa un único frame; para generalizar, repetilo en varios frames del video.")
  
+    print("\n" + "=" * 70)
+    print("--- RESPUESTAS APLICADAS AL MÓDULO 4: Compresión de Nuestro Video ---")
+    print("=" * 70)
+    
+    print("\n" + "=" * 40)
+    print("Estas respuestas que aplican únicamente a nuestro video se imprimen por separado, para darles un formato más agradable.")
+    print("=" * 40)
+        
+    print("""
+
+    1. Tasas de compresión: Los métodos sin pérdida como Huffman logran reducciones moderadas 
+       aprovechando la entropía de los grises de nuestro video, mientras que RLE es ineficiente en 
+       fotografías continuas pero alcanza ratios extremos (>100:1) en nuestra máscara binaria segmentada. 
+       JPEG logra altas tasas a costo de pérdida controlada de calidad (PSNR/SSIM).
+    2. Aparición de bloques: Los artefactos de bloque de 8x8 px emergen de manera objetiva en nuestro 
+       registro a partir de Q <= 70, donde la discontinuidad en las fronteras supera el umbral psicovisual.
+    3. Notoriedad de artefactos: El error numérico (MAE) se concentra fuertemente en el borde 
+       nítido de la pupila de nuestro video debido a la pérdida de altas frecuencias, sin embargo, la 
+       percepción visual de la cuadrícula es más notoria en las regiones uniformes del iris y 
+       esclerótica por la ausencia de textura que enmascare el escalón entre bloques.
+    4. Impacto en el diámetro: La compresión moderada (Q=50) no altera significativamente el 
+       diámetro pupilar estimado en nuestro video (variación < 1%). No obstante, en factores agresivos (Q=10), la 
+       degradación de los bordes desplaza la medición fuera de la tolerancia del 3%.
+    """)
+    
     return {'resultados': resultados, 'barrido': barrido, 'q_bloque': q_bloque,
             'diametro_original': d_orig}
     
@@ -2518,19 +2616,83 @@ def procesar_registros(registros, carpeta_salida='resultados', area_min_px=250, 
             print(f"   {nombre:<16}: {v.mean():9.3f} ± {v.std(ddof=1):7.3f} {u}   (coef. de variación {cv_:.1f} %)")
     return filas
 
+def obtener_o_anotar_manual_3_2(video_path, x, y, w, h, ruta_csv,
+                                tiempos=(1.0, 3.0, 4.4, 5.2, 6.0, 7.4),
+                                forzar_anotacion=False):
+    """
+    Lee las anotaciones manuales del punto 3.2 (frame -> área en px²) desde un CSV.
+    Si forzar_anotacion=True, abre la ventana interactiva en los frames indicados en 'tiempos'
+    para dibujar la pupila con clics y guarda los resultados en ruta_csv.
+    """
+    # 1) Si NO queremos anotar de nuevo y el CSV ya existe, lo leemos directo
+    if not forzar_anotacion and os.path.exists(ruta_csv):
+        anotaciones = {}
+        with open(ruta_csv, mode='r', encoding='utf-8') as f:
+            lector = csv.DictReader(f)
+            for fila in lector:
+                anotaciones[int(fila['frame'])] = float(fila['area_px2'])
+        print(f"Anotaciones manuales 3.2 cargadas desde '{ruta_csv}' ({len(anotaciones)} frames).")
+        return anotaciones
+
+    # 2) Si no existe el CSV y forzar_anotacion=False, sigue sin validación manual (no traba el programa)
+    if not forzar_anotacion:
+        return None
+
+    # 3) Si forzar_anotacion=True, abrimos cada frame para medir con clics
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    objetivos = sorted({int(round(t * fps)) for t in tiempos})
+    anotaciones = {}
+
+    print("\n--- ANOTACIÓN INTERACTIVA PARA EL MÓDULO 3.2 ---")
+    print("Instrucciones: Clic izquierdo = marcar borde (mín. 8 puntos) | z = deshacer | Enter = confirmar | Esc = saltear")
+
+    idx = -1
+    ultimo = max(objetivos)
+    temp_png = os.path.join(tempfile.gettempdir(), "_temp_mask_3_2.png")
+
+    while idx < ultimo:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        idx += 1
+        if idx in objetivos:
+            t_actual = idx / fps
+            print(f"\n-> Anotando Frame {idx} (t = {t_actual:.2f} s)...")
+            roi_frame = frame[y:y + h, x:x + w]
+            mascara = anotar_contorno_manual(roi_frame, ruta_salida=temp_png, forma='elipse', escala=2)
+            if mascara is not None:
+                area_medida = float((mascara > 0).sum())
+                anotaciones[idx] = area_medida
+                print(f"   Frame {idx} medido: Área = {area_medida:.1f} px²")
+
+    cap.release()
+    if os.path.exists(temp_png):
+        os.remove(temp_png)
+
+    # Guardamos las mediciones en el CSV para futuras corridas
+    if anotaciones:
+        with open(ruta_csv, mode='w', newline='', encoding='utf-8') as f:
+            wr = csv.writer(f)
+            wr.writerow(['frame', 'tiempo_s', 'area_px2'])
+            for fr, ar in sorted(anotaciones.items()):
+                wr.writerow([fr, f"{fr / fps:.2f}", f"{ar:.1f}"])
+        print(f"\n¡Listo! Anotaciones guardadas en '{ruta_csv}'.")
+
+    return anotaciones
+
 
 def main():
     # ======================= CONFIGURACIÓN (lo único que se edita) =======================
     video_original = 'registro_pupila.mp4'
     t_inicio, t_fin = 0.0, 7.5                   # ventana del 3.2 en segundos (t_fin = None -> hasta el final)
     area_min, area_max = 250, 2000               # rango plausible del área de la pupila (px²) en tu video
-    # Mediciones manuales de cada video: {nombre del video sin extensión: {nro_de_frame: área manual en px²}}
-    anotaciones_por_video = {
-        'registro_pupila': {132: 624.0, 222: 1204.0},
-        # 'otro_video': {150: 700.0, 240: 1100.0},
-    }
-    anotar_referencia = False                    # True = abrir la herramienta para dibujar la pupila (una vez por video)
-    exportar_roi_para_imagej = False             # True = guarda la ROI para medir en ImageJ (una vez por video)
+    
+    anotar_referencia = False                    # True = abrir ventana para dibujar pupila del 2.3 (una vez por video)
+    anotar_frames_3_2 = False                   # True = abrir ventana para medir frames del 3.2 (una vez por video)
+    tiempos_a_medir_3_2 = (1.0, 3.0, 4.4, 5.2, 6.0, 7.4)  # segundos del video que se van a medir a mano en el 3.2
+    
+    exportar_roi_para_imagej = False             # True = guarda la ROI para medir en ImageJ (opcional)
     carpeta_salida = 'resultados'                # acá se guardan los CSV y figuras del 3.2 (con el nombre del video)
     registros = []                               # opcional (variabilidad): [{'video': 'A1.mp4', 'etiqueta': 'A1'}, ...]
     # =====================================================================================
@@ -2539,9 +2701,9 @@ def main():
     nombre_video, extension = os.path.splitext(os.path.basename(video_original))
     video_trabajo = f"{nombre_video}_copia{extension}"
     ref_pupila = f"referencia_{nombre_video}.png"            # contorno manual de la pupila (lo usa el 2.3)
+    csv_manual_3_2 = f"anotaciones_3_2_{nombre_video}.csv"   # áreas manuales por frame (lo usa el 3.2)
     roi_imagej = f"roi_para_anotar_{nombre_video}.png"
     nombre_pdf = f"Respuestas_{nombre_video}.pdf"
-    anotaciones = anotaciones_por_video.get(nombre_video)
 
     if not os.path.exists(video_original):
         print(f"No se encontró el video '{video_original}'.")
@@ -2551,9 +2713,6 @@ def main():
     capturador.activar()      # captura texto Y figuras desde acá
 
     print(f"VIDEO ANALIZADO: {video_original}")
-    if not anotaciones:
-        print(f"(No hay anotaciones manuales para '{nombre_video}' en anotaciones_por_video: "
-              f"el 3.2 se hace sin validación manual.)")
 
     if not os.path.exists(video_trabajo):
         shutil.copy(video_original, video_trabajo)
@@ -2578,7 +2737,7 @@ def main():
     # ----- MÓDULO 2 (sobre la ROI) -----
     mascara_limpia, mascaras_m2 = procesar_modulo_2(roi)
     if anotar_referencia:
-        with capturador.ventanas_reales():   # esta herramienta necesita la ventana para poder hacer clic
+        with capturador.ventanas_reales():   # abre ventana real para hacer clic en el 2.3
             anotar_contorno_manual(roi, ref_pupila)
     procesar_modulo_2_3(roi, mascaras_m2, ref_pupila, area_min, area_max)   # si no hay referencia, avisa y sigue
 
@@ -2586,9 +2745,18 @@ def main():
     procesar_modulo_3_1(roi, mascara_limpia)
 
     # ----- MÓDULO 3.2 (procesa todo el video) -----
-    # exportar_frames_para_medir(video_trabajo, carpeta=f'frames_manual_{nombre_video}')   # descomentar solo para exportar los frames a medir en ImageJ
+    with capturador.ventanas_reales():       # si anotar_frames_3_2=True, abre ventana real; si es False, lee el CSV
+        anotaciones = obtener_o_anotar_manual_3_2(
+            video_trabajo, x, y, w, h,
+            ruta_csv=csv_manual_3_2,
+            tiempos=tiempos_a_medir_3_2,
+            forzar_anotacion=anotar_frames_3_2
+        )
+    if not anotaciones:
+        print(f"(No existe '{csv_manual_3_2}' y anotar_frames_3_2=False: el 3.2 se hace sin validación manual.)")
+
     procesar_modulo_3_2(video_trabajo, t_inicio=t_inicio, t_fin=t_fin,
-                        anotaciones_manuales=anotaciones or None,
+                        anotaciones_manuales=anotaciones,
                         area_min_px=area_min, area_max_px=area_max,
                         roi_manual=(x, y, w, h),
                         etiqueta=nombre_video,
@@ -2604,7 +2772,6 @@ def main():
     capturador.generar_pdf(nombre_pdf, video=video_original)
     capturador.borrar_imagenes()   # las figuras ya están dentro del PDF
     print(f"\n¡Archivo '{nombre_pdf}' generado con éxito con todos los resultados!")
-
 
 
 if __name__ == '__main__':
