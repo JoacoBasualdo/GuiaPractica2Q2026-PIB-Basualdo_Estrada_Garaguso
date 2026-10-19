@@ -1,4 +1,10 @@
 # =========================================
+# LEER el README antes de ejecutar para instrucciones
+# Las instrucciones se ejecutarán también en forma de ventana al iniciar el script, mediante la función mostrar_instrucciones_interactivas()
+# ============================================
+
+
+# =========================================
 # CONSULTAS
 # que hacer en la parte de analizar la pérdida de definición
 # Que quiere que hagamos en el 1.2.4 para el análisis de ruido y filtrado espacial
@@ -56,9 +62,9 @@ def mostrar_instrucciones_interactivas():
         "   - Buscá en 'main()' la línea: video_original = 'registro_pupila.mp4'\n"
         "   - Reemplazá 'registro_pupila.mp4' por el nombre del nuevo archivo de video (ej. 'video_prueba2.mp4').\n\n"
         "📌 2. CONFIGURAR ANOTACIONES MANUALES (True / False):\n"
-        "   - anotar_referencia = True / False\n"
+        "   - anotar_referencia = True / False (también en main())\n"
         "     (Ponelo en True la PRIMERA VEZ que analices un video nuevo para dibujar la máscara del Módulo 2.3).\n"
-        "   - anotar_frames_3_2 = True / False\n"
+        "   - anotar_frames_3_2 = True / False (también en main())\n "
         "     (Ponelo en True la PRIMERA VEZ que se trabaja con el nuevo video para medir con clics los frames del Módulo 3.2).\n\n"
         "ℹ️ Una vez creados los archivos .png y .csv de un video, volvé a poner ambas opciones en FALSE "
         "para que el programa corra 100% automatizado (ideal para la evaluación de la cátedra).\n"
