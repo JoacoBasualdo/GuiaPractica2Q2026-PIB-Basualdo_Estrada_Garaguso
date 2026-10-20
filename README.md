@@ -16,6 +16,7 @@ Este pipeline automatizado en Python procesa secuencias de video de la pupila hu
     En la línea "video_original = 'registro_pupila.mp4'", se debe reemplazar 'registro_pupila.mp4' por el nombre del video que se desea analizar.
 2. **Configuración de mediciones manuales:** también en main(), las funciones anotar_referencia y anotar_referencia_3_2 deben ponerse en "True" si es la primera vez que se analiza el video, para poder tomar registro de las mediciones manuales, y luego deben ponerse en False una vez creados los archivos .csv y .png
 3. **Respuestas:** hay respuestas que varían según el video a analizar, y respuestas que se corresponden al video original analizado por el grupo. Ambas se imprimen en el pdf. 
+4. **Archivos:** el script genera una serie de archivos. Para el módulo 2.3, genera la referencia_registro_pupila (cada vez que se delimita manualmente). Luego, se genera un csv con anotaciones de resultados de mediciones manuales para el módulo 3.2. La carpeta resultados contiene salidas del pipeline en los distintos módulos, principalmente del módulo 3.2.
 
 ---
 
