@@ -1246,7 +1246,13 @@ def procesar_modulo_2(roi):
     # ==========================================================
     
     # Descartamos Otsu y usamos un umbral estricto (< 45) para capturar solo el negro profundo de la pupila
-    _, mascara_base = cv2.threshold(blur, 45, 255, cv2.THRESH_BINARY_INV)
+    umbral_pupila = _umbral_pupila_auto(blur)
+    _, mascara_base = cv2.threshold(blur, umbral_pupila, 255, cv2.THRESH_BINARY_INV)
+    _, _, pt_osc, _ = cv2.minMaxLoc(blur)
+    _, etq = cv2.connectedComponents(mascara_base)
+    if etq[pt_osc[1], pt_osc[0]] > 0:
+        mascara_base = np.where(etq == etq[pt_osc[1], pt_osc[0]], 255, 0).astype(np.uint8)
+    print(f"Umbral automático de pupila: {umbral_pupila:.0f}")
     
     elemento_estructurante = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     
@@ -1297,6 +1303,8 @@ def procesar_modulo_2(roi):
 def _glcm_region(canal, region, niveles=32):
     """GLCM (distancia 1, 4 ángulos) usando solo los píxeles de 'region' (no se cuentan pares con píxeles de afuera)."""
     ys, xs = np.nonzero(region)
+    if ys.size == 0:                                   # región vacía: no se puede calcular la GLCM
+        return {k: float('nan') for k in ('contrast', 'homogeneity', 'energy', 'correlation')}
     y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
     q = (canal[y0:y1, x0:x1] // (256 // niveles)).astype(np.uint8)
     q[~region[y0:y1, x0:x1]] = niveles                              # nivel reservado para "fuera de la región"
@@ -1352,6 +1360,11 @@ def procesar_modulo_3_1(roi, mascara_limpia, factor_iris=2.6, usar_elipse=False)
     d = np.hypot(xx - cX, yy - cY)
     r_eq = np.sqrt(area / np.pi)
     iris = (d >= 1.25 * r_eq) & (d <= factor_iris * r_eq) & (gris < 235)
+    anillo_geom = (d >= 1.25 * r_eq) & (d <= factor_iris * r_eq)
+    print(f"[DIAG 3.1] ROI={roi.shape[:2]} | área máscara={area:.0f} | centroide=({cX:.1f},{cY:.1f}) | r_eq={r_eq:.1f} | "
+          f"px anillo (solo geometría)={int(anillo_geom.sum())} | px anillo final={int(iris.sum())} | "
+          f"% ROI saturado (gris>=235)={100 * (gris >= 235).mean():.1f} | gris en anillo: "
+          f"mín={gris[anillo_geom].min() if anillo_geom.any() else -1} mediana={np.median(gris[anillo_geom]) if anillo_geom.any() else -1:.0f}")
     regiones = {'Pupila': pup, 'Iris (anillo)': iris}
 
     vis = roi.copy()
@@ -2716,18 +2729,75 @@ def obtener_o_anotar_manual_3_2(video_path, x, y, w, h, ruta_csv,
 
     return anotaciones
 
+def tiempos_automaticos(video_path, margen=0.05):
+    """Instantes (s) a medir a mano, repartidos parejo según la duración del video."""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    dur = total / fps
+    n = int(np.clip(round(dur * 0.8), 4, 10))          # ~0.8 frames por segundo (tu caso: 6 en 7.5 s)
+    return tuple(float(t) for t in np.round(np.linspace(margen * dur, (1 - margen) * dur, n), 2))
+
+
+def _umbral_pupila_auto(blur_r, fallback=45, frac_max=np.pi / 36):
+    """Otsu recursivo: baja el umbral hasta que la zona oscura central sea compatible con una pupila
+    (no puede ocupar más de pi/36 de la ROI: es el mismo límite r <= lado/6 que usa el Módulo 3.2)."""
+    _, _, pt, _ = cv2.minMaxLoc(blur_r)
+    t, maxima = 255, frac_max * blur_r.size
+    for _ in range(5):
+        oscuros = blur_r[blur_r <= t]
+        if oscuros.size < 50 or oscuros.min() == oscuros.max():
+            return fallback
+        t, _ = cv2.threshold(oscuros.reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        n, et = cv2.connectedComponents((blur_r <= t).astype(np.uint8))
+        lab = et[pt[1], pt[0]]
+        if lab > 0 and (et == lab).sum() <= maxima:
+            return t
+    return t
+
+
+def estimar_rango_area(video_path, n_muestras=15, fallback=(250, 2000)):
+    """Estima (area_min, area_max) en px² midiendo la pupila en frames repartidos por todo el video."""
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    areas, lado = [], None
+    for i in np.linspace(0, max(total - 1, 0), n_muestras).astype(int):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+        ret, f = cap.read()
+        if not ret:
+            continue
+        x, y, w, h = obtener_roi_automatica(f)
+        lado = w
+        blur = cv2.GaussianBlur(f[y:y + h, x:x + w, 2], (15, 15), 0)
+        _, _, pt, _ = cv2.minMaxLoc(blur)
+        _, m = cv2.threshold(blur, _umbral_pupila_auto(blur), 255, cv2.THRESH_BINARY_INV)
+        n, et, st, _ = cv2.connectedComponentsWithStats(m)
+        lab = et[pt[1], pt[0]]                         # componente que contiene el punto más oscuro
+        if lab > 0:
+            areas.append(st[lab, cv2.CC_STAT_AREA])
+    cap.release()
+    if len(areas) < 3:
+        print(f"No se pudo estimar el rango de área; se usa {fallback}.")
+        return fallback
+    a_min = 0.5 * np.percentile(areas, 5)
+    a_max = min(2.0 * np.percentile(areas, 95), np.pi * (lado / 6) ** 2)   # tope: la ventana de trabajo no puede pasar la ROI
+    a_min, a_max = int(max(a_min, 30)), int(a_max)
+    print(f"Rango de área estimado automáticamente: {a_min}-{a_max} px² ({len(areas)} frames muestreados)")
+    return a_min, a_max
+
 
 def main():
     # ======================= VENTANA DE INSTRUCCIONES =======================
     mostrar_instrucciones_interactivas()
     # ======================= CONFIGURACIÓN (lo único que se edita) =======================
     video_original = 'registro_pupila.mp4'
-    t_inicio, t_fin = 0.0, 7.5                   # ventana del 3.2 en segundos (t_fin = None -> hasta el final)
-    area_min, area_max = 250, 2000               # rango plausible del área de la pupila (px²) en tu video
+    t_inicio, t_fin = 0.0, None                  # None -> todo el video                   # ventana del 3.2 en segundos (t_fin = None -> hasta el final)
+    area_min, area_max = estimar_rango_area(video_original)
     
-    anotar_referencia = False                    # True = abrir ventana para dibujar pupila del 2.3 (una vez por video)
-    anotar_frames_3_2 = False                   # True = abrir ventana para medir frames del 3.2 (una vez por video)
-    tiempos_a_medir_3_2 = (1.0, 3.0, 4.4, 5.2, 6.0, 7.4)  # segundos del video que se van a medir a mano en el 3.2
+    anotar_referencia = True                    # True = abrir ventana para dibujar pupila del 2.3 (una vez por video)
+    anotar_frames_3_2 = True                   # True = abrir ventana para medir frames del 3.2 (una vez por video)
+    tiempos_a_medir_3_2 = tiempos_automaticos(video_original)
     
     exportar_roi_para_imagej = False             # True = guarda la ROI para medir en ImageJ (opcional)
     carpeta_salida = 'resultados'                # acá se guardan los CSV y figuras del 3.2 (con el nombre del video)
